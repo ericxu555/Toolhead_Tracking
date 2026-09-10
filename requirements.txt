@@ -1,0 +1,42 @@
+# Install with:
+#   pip install -r requirements.txt
+#
+# torch and torchvision are intentionally left unpinned here. Install them
+# FIRST, separately, matching your machine's CUDA version, because the CUDA
+# builds are not distributed on PyPI. See step 2 in README.md.
+# Reference environment: torch 2.11.0+cu128, torchvision 0.26.0+cu128.
+torch
+torchvision
+
+segmentation-models-pytorch==0.5.0
+opencv-python==4.12.0.88
+numpy==2.2.6
+pillow==12.2.0
+matplotlib==3.10.7
+
+# Tool-tip tracking (tapnextpp_hybrid.py).
+tapnet @ git+https://github.com/google-deepmind/tapnet.git@989a1fd62f7b2a3cf7f1c339bbde38e086e3a0fc
+
+# tapnet imports einops but does not declare it, so pip will not pull it in.
+# Without it, TAPNext++ fails to import and tracking cannot start.
+einops
+
+# Automatic tool-tip seeding (edge_anchored_tracking/auto_seed_tip.py):
+# runs the keypoint_rcnn.onnx detector, replacing the manual click step.
+#
+# This is the CPU build, which works everywhere and is adequate offline: the
+# detector runs only during seeding, not per frame. On a CUDA machine, and
+# especially for the real-time ROS 2 node, install the GPU build instead:
+#   pip uninstall -y onnxruntime && pip install onnxruntime-gpu
+# Verify it took effect (CUDAExecutionProvider should be listed):
+#   python -c "import onnxruntime as ort; print(ort.get_available_providers())"
+onnxruntime==1.27.0
+
+# SAM2 tip refinement (edge_anchored_tracking/refine_tip_with_sam2_v2.py):
+# skeletonize() is used to walk along the tool's centerline.
+scikit-image==0.26.0
+
+# SAM2 itself is not on PyPI, and is only needed for the optional tip
+# refinement. Installed separately in step 6 of README.md:
+#   pip install git+https://github.com/facebookresearch/sam2.git
+# (installs as the "SAM-2" distribution, imported as `sam2`)

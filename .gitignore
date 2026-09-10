@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+
+checkpoints_tumor_binary10/*.pth
+checkpoints_tumor_binary10/*.json
+
+# SAM2 checkpoint + tool-tip detector weights (downloaded separately, see README)
+checkpoints_sam2/*.pt
+*.onnx
+
+*_out/
+*.mp4
+*.csv
+*seed*.json
