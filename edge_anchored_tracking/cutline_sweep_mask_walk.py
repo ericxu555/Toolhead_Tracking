@@ -779,9 +779,11 @@ def main():
     vw = cv2.VideoWriter(os.path.join(outdir, "cutline_sweep_walk.mp4"),
                          cv2.VideoWriter_fourcc(*"mp4v"), 30, (W, H))
     accum_mask = np.zeros((H, W), dtype=bool)
+    _PREV_ARC_FRAC = [None]   # last frame's arc, as a fraction of the perimeter
+    _PREV_SEG_LEN = [None]    # last frame's sweep length, in px
+    _SEG_VETOED = [0]         # consecutive frames the sweep leapt
     _START_STUB = [None]  # start-end anchor, fixed on first use
     _KEEP_SIDE = [None]   # which partition label is the resection
-    _KEEP_SEED = [None]   # a point known to lie on that side
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(DILATE | 1, 3),) * 2) if DILATE > 0 else None
 
     for i, fp in enumerate(files):
@@ -961,24 +963,96 @@ def main():
                                        start_stub=_START_STUB[0])
                 _keep = None
                 if _lab is not None:
-                    if _KEEP_SIDE[0] is None:
-                        _off = 8.0 if RESECT_SIDE != "left" else -8.0
-                        for _d in (_off, _off * 2, _off * 4):
-                            _c = _side_of(_lab, (tx + _d, ty), H, W)
-                            if _c:
-                                _KEEP_SIDE[0] = _c
-                                _KEEP_SEED[0] = np.array([tx + _d, ty])
-                                break
-                    elif _KEEP_SEED[0] is not None:
-                        # Re-identify by position: labels are renumbered every
-                        # frame, so the stored seed says which side is which.
-                        _c = _side_of(_lab, _KEEP_SEED[0], H, W)
-                        if _c:
-                            _KEEP_SIDE[0] = _c
+                    # Identify the resected side by WHERE THE TWO REGIONS
+                    # LIE, recomputed every frame.
+                    #
+                    # Two earlier approaches failed. Probing 8-32 px either
+                    # side of the tip is a coin flip, because on the first
+                    # frame that can be partitioned the tip sits on the cut
+                    # where the two regions meet: measured on the 0916
+                    # screencast it named the LEFT region (centroid x=209)
+                    # while the resection was on the right (x=320), and stayed
+                    # wrong for the episode. Storing that choice as a seed
+                    # point and re-reading it later drifts, because the cut
+                    # advances and the regions reshape around the point: on
+                    # failure_case1 the seed (298,220) read label 1 until f232,
+                    # sat on the barrier at f236 and read label 2 by f238, so
+                    # keep_side flipped and the side clip cut the sweep from
+                    # 27,110 px to 622 px for the rest of the episode.
+                    #
+                    # Comparing the two regions' centroids answers it directly,
+                    # and has no drift -- on failure_case1 region 1 stayed the
+                    # right-hand one at every frame (c1_x 301->346 against
+                    # c2_x 210->220). connectedComponents renumbers each frame,
+                    # so recomputing is also what keeps the identity stable.
+                    _m1 = (_lab == 1)
+                    _m2 = (_lab == 2)
+                    if _m1.any() and _m2.any():
+                        _x1 = float(np.nonzero(_m1)[1].mean())
+                        _x2 = float(np.nonzero(_m2)[1].mean())
+                        if RESECT_SIDE == "left":
+                            _KEEP_SIDE[0] = 1 if _x1 <= _x2 else 2
+                        else:
+                            _KEEP_SIDE[0] = 1 if _x1 >= _x2 else 2
+
+                    # Only clip when the partition genuinely has two sides.
+                    # Once the cut no longer separates the tumor, the labelling
+                    # returns a single region and the stored keep_side names a
+                    # label that no longer exists -- clipping against it would
+                    # delete the whole sweep (measured: 11,448 px -> 1,164 px
+                    # on the 0916 screencast, where region 2 is empty from
+                    # f100 onward). With one region there is no side to choose,
+                    # so the clip simply does not apply.
                     _keep = _KEEP_SIDE[0]
+                    if _keep is not None and not (_lab == _keep).any():
+                        _keep = None
+                # THE SWEEP IS CONTINUOUS: A ONE-FRAME LEAP IS NOT A SWEEP.
+                #
+                # `segment_end_on_perimeter` ranks boundary hits by alignment
+                # with the ray, then walks the ranking rejecting any candidate
+                # whose segment would cross the cut path. When the cut is fresh
+                # or the tip sits beside it, EVERY near candidate crosses, and
+                # the search keeps walking until something far away happens to
+                # pass -- landing on the opposite side of the tumor.
+                #
+                # Measured on the 0916 screencast f465: the nearest boundary
+                # was 20 px from the tip, but the accepted endpoint was 269 px
+                # away at (197,249). The frames either side used 21 px and
+                # 20 px. That one frame swept in ~25,000 px, which is the flash
+                # seen when the tool re-enters.
+                #
+                # The tool advances a few px per frame, so the distance it
+                # sweeps changes by a few px too. A segment many times longer
+                # than the previous frame's, for one frame, is the search
+                # having failed rather than the tool having moved. Skipping it
+                # costs nothing: accumulation is monotonic, so the region is
+                # claimed on the next frame that resolves cleanly.
+                #
+                # Scale comes from the previous frame, not from a constant --
+                # a long sweep is fine if the sweep was already long.
                 seg_end = segment_end_on_perimeter(perim, (tx, ty), perp_dir,
                                                    cutline_x, side_lab=_lab,
                                                    keep_side=_keep)
+                if seg_end is not None and _PREV_SEG_LEN[0] is not None:
+                    _sl_now = float(np.hypot(seg_end[0] - tx, seg_end[1] - ty))
+                    if _sl_now > 4.0 * max(_PREV_SEG_LEN[0], 8.0):
+                        # A leap this size is only rejected while it looks
+                        # TRANSIENT. If the search keeps returning it, the
+                        # sweep really has grown -- the tool moved out, or the
+                        # tumor boundary shifted -- and refusing forever would
+                        # freeze the mask. On DaggerMatched_NoRec_exp2 the
+                        # sweep legitimately grows from 12 px to ~118 px and
+                        # stays there; vetoing every frame pinned the reference
+                        # at 12 px and cut that episode from 806 px to 19.
+                        _SEG_VETOED[0] += 1
+                        if _SEG_VETOED[0] <= 2:
+                            seg_end = None
+                        else:
+                            # Accept it and re-anchor, so the next frame is
+                            # judged against the sweep as it now is.
+                            _PREV_SEG_LEN[0] = _sl_now
+                    else:
+                        _SEG_VETOED[0] = 0
                 if seg_end is not None:
                     # The polygon's LEFT edge is the path as the tool actually
                     # travelled it, not a per-row resampling of it. Sampling by
@@ -1107,6 +1181,48 @@ def main():
                     else:
                         arc = _short
 
+                    # THE SWEEP IS CONTINUOUS: VETO A ONE-FRAME EXCURSION.
+                    #
+                    # The tool advances a little each frame, so the boundary
+                    # the sweep closes along grows a little too. The side test
+                    # above decides which arc is on the resected side; this
+                    # only vetoes its choice when that choice would be a spike
+                    # -- a jump to nearly the whole perimeter that the other
+                    # candidate does not require.
+                    #
+                    # Measured on the 0916 screencast f353: the arc endpoints
+                    # fell 13 points apart on an 826-point perimeter, so the
+                    # candidates were a 14-point sliver and an 814-point
+                    # near-complete wrap. `_frac_wrong_side` scored the sliver
+                    # 1.00 over just 14 samples -- two more than
+                    # ARC_MIN_SAMPLES -- which promoted the 814-point arc and
+                    # added 49,000 px in one frame. The next frame scored 5
+                    # samples, fell below the guard, and returned to a 5-point
+                    # arc. A sliver's score is not evidence about a near-full
+                    # wrap.
+                    #
+                    # This is a VETO, not a preference. An earlier version
+                    # picked whichever candidate sat closer to the previous
+                    # arc, which on cond2_exp1 (short ~0.14, long ~0.86 every
+                    # frame) always chose short, overrode the side test on 241
+                    # of 242 frames, and froze the sweep at a sliver -- 25,493
+                    # px down to 3. Vetoing only a near-total wrap leaves every
+                    # ordinary frame to the side test, which is what those
+                    # episodes rely on.
+                    _prev_fr = _PREV_ARC_FRAC[0]
+                    if _prev_fr is not None:
+                        _chosen_fr = len(arc) / max(len(perim), 1)
+                        _alt = _long if arc is _short else _short
+                        _alt_fr = len(_alt) / max(len(perim), 1)
+                        # A sweep cannot leap from a sliver to swallowing the
+                        # boundary in one frame and back out the next.
+                        if (_chosen_fr - _prev_fr > 0.5
+                                and _chosen_fr > 0.9
+                                and _alt_fr < _chosen_fr):
+                            arc = _alt
+                    _PREV_ARC_FRAC[0] = len(arc) / max(len(perim), 1)
+                    _PREV_SEG_LEN[0] = float(np.hypot(seg_end[0] - tx,
+                                                      seg_end[1] - ty))
                     poly = cut_pts + [(float(seg_end[0]), float(seg_end[1]))] + \
                            [(float(p[0]), float(p[1])) for p in arc]
                     filled = np.zeros((H, W), dtype=np.uint8)

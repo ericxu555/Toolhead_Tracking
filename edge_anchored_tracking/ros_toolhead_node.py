@@ -327,7 +327,9 @@ class ToolheadNode(Node):
         self.cut_path = []
         self.prev_tip_y = None
         self.keep_side = None      # which side of the cut is resected
-        self.keep_seed = None      # a point known to be on that side
+        self.prev_arc_frac = None  # last frame's arc, as a fraction of the perimeter
+        self.prev_seg_len = None   # last frame's sweep length, in px
+        self.seg_vetoed = 0        # consecutive frames the sweep leapt
         self.start_stub = None     # start-end barrier anchor, set once
         self.frontier_y = -1
         self.accum_mask = None
@@ -719,7 +721,9 @@ class ToolheadNode(Node):
         self.cut_path = []
         self.prev_tip_y = None
         self.keep_side = None
-        self.keep_seed = None
+        self.prev_arc_frac = None
+        self.prev_seg_len = None
+        self.seg_vetoed = 0
         self.start_stub = None
         self.accum_mask = np.zeros((self.H, self.W), dtype=bool)
         self.seed_xy = seed_xy
@@ -866,22 +870,65 @@ class ToolheadNode(Node):
                     # the tip, then re-identified by that stored point every
                     # frame: connectedComponents renumbers labels each frame, so
                     # the seed is what says which label is which.
-                    if self.keep_side is None:
-                        off = 8.0 if self.resect_side != "left" else -8.0
-                        for d in (off, off * 2, off * 4):
-                            c = G._side_of(side_lab, (tx + d, ty), H, W)
-                            if c:
-                                self.keep_side = c
-                                self.keep_seed = np.array([tx + d, ty])
-                                break
-                    elif self.keep_seed is not None:
-                        c = G._side_of(side_lab, self.keep_seed, H, W)
-                        if c:
-                            self.keep_side = c
+                    # Identify the resected side by WHERE THE TWO REGIONS
+                    # LIE, recomputed every frame.
+                    #
+                    # Probing beside the tip is a coin flip: on the first frame
+                    # that can be partitioned the tip sits on the cut, where the
+                    # two regions meet. Storing that choice as a seed point then
+                    # drifts, because the cut advances and the regions reshape
+                    # around it -- the point ends up in the other region,
+                    # keep_side flips, and the side clip inverts, cutting the
+                    # sweep to a sliver for the rest of the episode. Comparing
+                    # the two regions' centroids answers it directly and does
+                    # not drift; connectedComponents renumbers every frame, so
+                    # recomputing is what keeps the identity stable.
+                    m1 = (side_lab == 1)
+                    m2 = (side_lab == 2)
+                    if m1.any() and m2.any():
+                        x1 = float(np.nonzero(m1)[1].mean())
+                        x2 = float(np.nonzero(m2)[1].mean())
+                        if self.resect_side == "left":
+                            self.keep_side = 1 if x1 <= x2 else 2
+                        else:
+                            self.keep_side = 1 if x1 >= x2 else 2
+                # Once the cut no longer separates the tumor the labelling
+                # returns a single region, and a stored keep_side then names a
+                # label that no longer exists -- clipping against it would
+                # delete the whole sweep. With one region there is no side to
+                # choose, so the clip does not apply.
+                keep_now = self.keep_side
+                if (keep_now is not None and side_lab is not None
+                        and not (side_lab == keep_now).any()):
+                    keep_now = None
                 seg_end = G.segment_end_on_perimeter(
                     perim, (tx, ty), perp_dir, self.cutline_x,
-                    side_lab=side_lab, keep_side=self.keep_side,
+                    side_lab=side_lab, keep_side=keep_now,
                     resect_side=self.resect_side)
+                # THE SWEEP IS CONTINUOUS: A ONE-FRAME LEAP IS NOT A SWEEP.
+                #
+                # segment_end_on_perimeter walks its ranked boundary hits
+                # rejecting any whose segment would cross the cut path. When
+                # every near candidate crosses, the search keeps walking until
+                # something far away happens to pass -- landing on the opposite
+                # side of the tumor and sweeping in tens of thousands of px for
+                # a single frame. Measured offline: the nearest boundary sat
+                # 20 px from the tip while the accepted endpoint was 269 px
+                # away, with the frames either side using 21 px and 20 px.
+                #
+                # Scale comes from the previous frame, not a constant. A leap
+                # that persists is real growth and is let through after a couple
+                # of frames, so the sweep can never be frozen.
+                if seg_end is not None and self.prev_seg_len is not None:
+                    sl_now = float(np.hypot(seg_end[0] - tx, seg_end[1] - ty))
+                    if sl_now > 4.0 * max(self.prev_seg_len, 8.0):
+                        self.seg_vetoed += 1
+                        if self.seg_vetoed <= 2:
+                            seg_end = None
+                        else:
+                            self.prev_seg_len = sl_now
+                    else:
+                        self.seg_vetoed = 0
                 if seg_end is not None:
                     # Contiguous PREFIX of the trace, never a filter: dropping
                     # scattered points splices non-neighbours together and puts
@@ -949,6 +996,22 @@ class ToolheadNode(Node):
                     else:
                         arc = short
 
+                    if self.prev_arc_frac is not None:
+                        chosen_fr = len(arc) / max(len(perim), 1)
+                        alt = long_ if arc is short else short
+                        alt_fr = len(alt) / max(len(perim), 1)
+                        # A sweep cannot leap from a sliver to swallowing the
+                        # boundary in one frame and back out the next. Veto
+                        # only a near-total wrap that the alternative does not
+                        # require; every ordinary frame is left to the side
+                        # test above.
+                        if (chosen_fr - self.prev_arc_frac > 0.5
+                                and chosen_fr > 0.9
+                                and alt_fr < chosen_fr):
+                            arc = alt
+                    self.prev_arc_frac = len(arc) / max(len(perim), 1)
+                    self.prev_seg_len = float(np.hypot(seg_end[0] - tx,
+                                                       seg_end[1] - ty))
                     poly = cut_pts + [(float(seg_end[0]), float(seg_end[1]))] +                            [(float(p[0]), float(p[1])) for p in arc]
                     filled = np.zeros((H, W), dtype=np.uint8)
                     cv2.fillPoly(filled, [np.array(poly, np.int32).reshape(-1, 1, 2)], 1)
@@ -956,9 +1019,9 @@ class ToolheadNode(Node):
                     # Vetting only the sweep endpoint is not enough: the arc can
                     # wrap the far side of the tumor and fill the unresected
                     # half however the endpoint was chosen.
-                    if side_lab is not None and self.keep_side:
+                    if side_lab is not None and keep_now:
                         frame_mask &= ~((side_lab > 0)
-                                        & (side_lab != self.keep_side))
+                                        & (side_lab != keep_now))
 
         # Monotonic union, re-clipped to the tumor every frame. The clip is
         # load-bearing: it lets a wrongly-included pixel drop back out once
