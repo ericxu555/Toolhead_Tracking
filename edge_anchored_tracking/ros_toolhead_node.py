@@ -128,7 +128,7 @@ G = load_module_functions(
 # Mask-construction parameters. These mirror the offline defaults; see the
 # README's "Mask parameters" table.
 TIP_SMOOTH = 15          # frames of moving average on the tip trajectory
-MASK_EMA = 0.5           # tumor-probability smoothing; 1.0 disables
+MASK_EMA = 0.3           # tumor-probability smoothing; 1.0 disables
 DILATE = 0               # optional dilation of the displayed mask, in pixels
 
 # Seeding parameters, matching auto_seed_tip.py.
@@ -776,7 +776,7 @@ class ToolheadNode(Node):
         raw_prob = G.raw_tumor_mask(self.engine, rgb, H, W)
         self.ema_mask_prob = raw_prob if self.ema_mask_prob is None else \
             MASK_EMA * raw_prob + (1 - MASK_EMA) * self.ema_mask_prob
-        T = G.largest_component(self.ema_mask_prob > 0.5)
+        T = G.tumor_mask_from_prob(self.ema_mask_prob)
         perim = G.outer_perimeter(T)
 
         tx, ty = tip_xy

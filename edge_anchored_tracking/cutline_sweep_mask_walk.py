@@ -81,6 +81,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 import numpy as np, cv2, torch
 from PIL import Image
+from scipy.ndimage import binary_fill_holes
 from src.inference_engine import InferenceEngine
 
 video_dir = sys.argv[1]
@@ -89,16 +90,16 @@ outdir = sys.argv[3] if len(sys.argv) > 3 else \
     os.path.join(REPO_ROOT, "edge_anchored_tracking", "cutline_sweep_walk_out")
 RESECT_SIDE = sys.argv[4] if len(sys.argv) > 4 else "right"
 TIP_SMOOTH = int(sys.argv[5]) if len(sys.argv) > 5 else 15
-MASK_EMA = float(sys.argv[6]) if len(sys.argv) > 6 else 0.5   # 1.0 = no smoothing (use raw frame)
+MASK_EMA = float(sys.argv[6]) if len(sys.argv) > 6 else 0.3   # 1.0 = no smoothing (use raw frame)
 DILATE = int(sys.argv[7]) if len(sys.argv) > 7 else 0
 os.makedirs(outdir, exist_ok=True)
 
 SPATIAL_MODEL = os.environ.get(
     "SPATIAL_MODEL",
-    os.path.join(REPO_ROOT, "checkpoints_tumor_binary10", "best_model_epoch_swa.pth"))
+    os.path.join(REPO_ROOT, "checkpoints_tumor_binary11", "best_model_epoch_swa.pth"))
 SPATIAL_META = os.environ.get(
     "SPATIAL_META",
-    os.path.join(REPO_ROOT, "checkpoints_tumor_binary10", "best_model_epoch_swa_metadata.json"))
+    os.path.join(REPO_ROOT, "checkpoints_tumor_binary11", "best_model_epoch_swa_metadata.json"))
 
 SEG_TANGENT_MAX_COS = 0.12  # a long sweep may not run along the tumor edge
 SEG_TANGENT_MIN_LEN = 120.0 # ...only checked beyond this length, in px
@@ -123,6 +124,30 @@ def largest_component(mask_bool):
         big = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
         return (lbl == big)
     return mask_bool
+
+
+# Threshold for calling a pixel tumor. 0.6 rather than 0.5: the boundary-
+# weighted loss makes the model confident well inside the tumor and soft at
+# the rim, so the higher cut trims that halo without eating the body.
+MASK_THRESHOLD = 0.6
+
+
+def tumor_mask_from_prob(prob):
+    """The tumor mask the pipeline acts on, from a (smoothed) probability map.
+
+    Holes are filled: the boundary-weighted loss leaves interior specks
+    unlabelled where the tissue is specular or blood-darkened, and those are
+    not holes in the tumor.
+
+    Every connected region is KEPT. An earlier version kept only the largest,
+    which silently deleted a genuinely multi-focal tumor -- and on hazy frames,
+    where the model fragments one tumor into patches, it deleted most of the
+    real mask with it.
+    """
+    m = prob > MASK_THRESHOLD
+    if m.any():
+        m = binary_fill_holes(m)
+    return m
 
 
 def contour_of(T):
@@ -791,7 +816,7 @@ def main():
         raw_prob = raw_tumor_mask(engine, img_rgb, H, W)
         ema_mask_prob = raw_prob if ema_mask_prob is None else \
             MASK_EMA * raw_prob + (1 - MASK_EMA) * ema_mask_prob
-        T = largest_component(ema_mask_prob > 0.5)
+        T = tumor_mask_from_prob(ema_mask_prob)
         # The tumor's TRUE outer perimeter, with the toolhead notches bridged
         # (convex hull). The raw contour dives into the tool cutouts and runs
         # ~3 px from the tip, which makes any local tangent there meaningless;
