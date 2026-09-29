@@ -59,7 +59,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Image, JointState
-from geometry_msgs.msg import PointStamped, PoseStamped
+from geometry_msgs.msg import (PointStamped, PoseStamped,
+                               PoseWithCovarianceStamped)
 from std_srvs.srv import Trigger
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -247,15 +248,33 @@ class ToolheadNode(Node):
         self.calib_wh = None           # (width, height) the calibration used
         self.calib_path = None         # which file was loaded
         self._pose_warned = False
+        self.n_pose = 0                # tip poses received this run
 
         if self.tip_source in ("pose_seed", "pose_only"):
             self._load_calibration()
-            pqos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
-                              history=HistoryPolicy.KEEP_LAST, depth=1)
-            self.create_subscription(PoseStamped, self.pose_topic,
-                                     self._on_pose, pqos)
+            # Subscribe RELIABLE *and* BEST_EFFORT. An incompatible
+            # reliability pair delivers nothing and logs nothing, which is
+            # indistinguishable from a silent publisher; taking both removes
+            # the guess. _on_pose only stores the newest sample, so receiving
+            # the same message twice changes nothing.
+            # The visual-servoing smoother publishes
+            # PoseWithCovarianceStamped; other sources publish a plain
+            # PoseStamped. A subscription with the wrong type never connects
+            # and never logs, so subscribe with both and let whichever
+            # matches deliver -- the same reasoning as the reliability pair
+            # below. _on_pose reads only the position, which sits at a
+            # different depth in the two messages.
+            for msg_type in (PoseWithCovarianceStamped, PoseStamped):
+                for rel in (ReliabilityPolicy.RELIABLE,
+                            ReliabilityPolicy.BEST_EFFORT):
+                    self.create_subscription(
+                        msg_type, self.pose_topic, self._on_pose,
+                        QoSProfile(reliability=rel,
+                                   history=HistoryPolicy.KEEP_LAST, depth=1))
             self.get_logger().info(
-                f"Tip source: {self.tip_source} from {self.pose_topic}")
+                f"Tip source: {self.tip_source} from {self.pose_topic} "
+                f"(PoseStamped + PoseWithCovarianceStamped, "
+                f"reliable + best-effort)")
 
         self._tool_held = False        # last debounced button state
         self._tool_release_t = None    # when the button first read released
@@ -385,6 +404,10 @@ class ToolheadNode(Node):
 
     def _reset_episode_state(self):
         self.H = self.W = None
+        # Arm the projection warnings again for each episode: they fire once
+        # per run, and a press that fails after an earlier one would otherwise
+        # report the bare error with none of the explanation.
+        self._pose_warned = False
         self.seed_buffer = []          # (frame, labels, scores, kps) while seeding
         self.seed_votes = []
         self.tracker = None
@@ -790,10 +813,23 @@ class ToolheadNode(Node):
             f"cx={self.K[0, 2]:.1f} cy={self.K[1, 2]:.1f}")
 
     def _on_pose(self, msg):
-        """Keep the newest tip pose. Projection happens per image frame."""
-        pos = msg.pose.position
+        """Keep the newest tip pose. Projection happens per image frame.
+
+        Accepts either message type: PoseWithCovarianceStamped nests the pose
+        one level deeper (msg.pose.pose) than PoseStamped (msg.pose). The
+        covariance is not used -- the smoother's own uncertainty does not
+        change where the tip is drawn.
+        """
+        inner = msg.pose
+        pos = getattr(inner, "pose", inner).position
         self.last_pose = (float(pos.x), float(pos.y), float(pos.z))
         self.last_pose_stamp = msg.header.stamp
+        self.n_pose += 1
+        if self.n_pose == 1:
+            self.get_logger().info(
+                f"First tip pose received: "
+                f"({pos.x:.4f}, {pos.y:.4f}, {pos.z:.4f}) m "
+                f"frame_id={msg.header.frame_id or '(empty)'}")
 
     def _project_tip(self):
         """The newest tip pose as a pixel in the PROCESSING frame, or None.
@@ -812,6 +848,14 @@ class ToolheadNode(Node):
             return None
         x, y, z = self.last_pose
         if z <= 1e-6:
+            # z is depth along the optical axis; <=0 puts the tip at or behind
+            # the image plane, which no intrinsic projection can place. Almost
+            # always means the pose is in some other frame than the camera's.
+            if not self._pose_warned:
+                self._pose_warned = True
+                self.get_logger().warn(
+                    f"Tip pose has z={z:.4f} m (must be > 0). The pose is "
+                    f"probably not expressed in the camera optical frame.")
             return None
 
         pts = np.array([[[x, y, z]]], dtype=np.float64)
@@ -828,8 +872,11 @@ class ToolheadNode(Node):
             if not self._pose_warned:
                 self._pose_warned = True
                 self.get_logger().warn(
-                    f"Tip projects outside the image ({u:.0f},{v:.0f}); "
-                    f"check camera_model and the calibration folder.")
+                    f"Tip projects outside the image: ({u:.0f},{v:.0f}) not "
+                    f"within {self.W}x{self.H}. camera_model="
+                    f"{self.camera_model}; try the other one "
+                    f"(raw <-> rect). Pose was "
+                    f"({x:.4f}, {y:.4f}, {z:.4f}) m.")
             return None
         return np.array([u, v], dtype=np.float32)
 
@@ -854,9 +901,28 @@ class ToolheadNode(Node):
                     frame, header,
                     f"SEEDING  waiting for {self.pose_topic}")
                 if len(self.seed_votes) >= SEED_MAX_FRAMES:
-                    self.get_logger().error(
-                        f"No usable tip pose in the first {SEED_MAX_FRAMES} "
-                        f"frames on {self.pose_topic}. Stopping episode.")
+                    # Distinguish "nothing arrived" from "arrived but could
+                    # not be projected" -- the fixes are completely different.
+                    if self.n_pose == 0:
+                        self.get_logger().error(
+                            f"No tip pose received at all on "
+                            f"{self.pose_topic} during {SEED_MAX_FRAMES} "
+                            f"frames. The topic is not publishing, the name "
+                            f"is wrong, or the type is not PoseStamped. "
+                            f"Check: ros2 topic info {self.pose_topic} "
+                            f"--verbose")
+                    else:
+                        x, y, z = self.last_pose
+                        self.get_logger().error(
+                            f"{self.n_pose} tip poses received but none could "
+                            f"be projected into the image. Last pose "
+                            f"({x:.4f}, {y:.4f}, {z:.4f}) m, camera_model="
+                            f"{self.camera_model}, calibration "
+                            f"{self.calib_wh[0]}x{self.calib_wh[1]} -> "
+                            f"processing {self.W}x{self.H}. "
+                            f"A z<=0 means the pose is not in the camera "
+                            f"frame; a large u/v means camera_model or the "
+                            f"calibration is wrong.")
                     with self.lock:
                         self.state = IDLE
                 return
