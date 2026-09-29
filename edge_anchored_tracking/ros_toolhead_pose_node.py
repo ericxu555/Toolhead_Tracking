@@ -158,6 +158,14 @@ CALIB_RELPATH = os.path.join("calibration", "camera", "ves_camera.yaml")
 TOOL_JOINT_NAME = "tool"
 TOOL_PRESSED = 0.5        # midpoint of the 0.0/1.0 signal
 TOOL_RELEASE_HOLD = 0.5   # seconds the button must read released before ending
+
+# trigger_mode:=autonomous. The action-chunking policy asserts the tool signal
+# in bursts with the signal low between chunks, so the release hold that works
+# for a human press (a sample or two of dropout) would end the episode at every
+# chunk boundary. This is the same idea with a horizon long enough to bridge a
+# whole gap: set it above the longest pause the policy leaves, and below the
+# time you would wait before deciding the run is over.
+AUTONOMOUS_IDLE_TIMEOUT = 10.0
 DEFAULT_OUTPUT_ROOT = os.path.join(REPO_ROOT, "Output")
 
 # The models were trained on 540x540 frames, while /ves_camera/image publishes
@@ -186,6 +194,8 @@ class ToolheadNode(Node):
         # follow the Virtuoso's cut button, so a resection is captured without
         # anyone touching the terminal.
         self.declare_parameter("trigger_mode", "service")
+        self.declare_parameter("autonomous_idle_timeout",
+                               AUTONOMOUS_IDLE_TIMEOUT)
         self.declare_parameter("tool_topic", DEFAULT_TOOL_TOPIC)
         # Where the per-frame tool tip comes from.
         #   detector  -- keypoint R-CNN + SAM2 seed, then TAPNext++ (default)
@@ -206,6 +216,12 @@ class ToolheadNode(Node):
         self.resect_side = self.get_parameter("resect_side").value
         self.use_refine = bool(self.get_parameter("refine").value)
         self.trigger_mode = str(self.get_parameter("trigger_mode").value).lower()
+        self.autonomous_idle = float(
+            self.get_parameter("autonomous_idle_timeout").value)
+        if self.trigger_mode not in ("service", "tool", "autonomous"):
+            raise SystemExit(
+                f"trigger_mode must be service, tool or autonomous "
+                f"(got {self.trigger_mode!r})")
         self.tool_topic = self.get_parameter("tool_topic").value
         self.tip_source = str(self.get_parameter("tip_source").value).lower()
         self.pose_topic = self.get_parameter("pose_topic").value
@@ -271,7 +287,7 @@ class ToolheadNode(Node):
         self._tool_seen = False        # has any joint message arrived
         self._tool_ignore = False      # ignore a press held at startup
 
-        if self.trigger_mode == "tool":
+        if self.trigger_mode in ("tool", "autonomous"):
             # Joint state is a continuous stream where only the newest value
             # matters, so a depth-1 BEST_EFFORT queue is enough and cannot
             # build a backlog.
@@ -281,7 +297,12 @@ class ToolheadNode(Node):
                                      self._on_joint, jqos)
             self.get_logger().info(
                 f"Trigger: tool button on {self.tool_topic} "
-                f"(joint '{TOOL_JOINT_NAME}'). Hold to cut; release to save.")
+                f"(joint '{TOOL_JOINT_NAME}'). "
+                + ("Hold to cut; release to save."
+                   if self.trigger_mode == "tool" else
+                   f"Autonomous: one episode per run, ending after "
+                   f"{self.autonomous_idle:.0f}s with no signal "
+                   f"(or Ctrl-C)."))
         else:
             self.get_logger().info(
                 "Trigger: /toolhead/start and /toolhead/stop services.")
@@ -521,13 +542,17 @@ class ToolheadNode(Node):
             return
 
         # Released. Wait out the hold before ending, so a brief dropout in the
-        # signal does not cut the episode short.
+        # signal does not cut the episode short. In autonomous mode that hold
+        # spans a whole inter-chunk gap, so the policy's bursts read as one
+        # continuous episode instead of one episode per chunk.
         if self._tool_held:
             now = time.time()
+            hold = (self.autonomous_idle if self.trigger_mode == "autonomous"
+                    else TOOL_RELEASE_HOLD)
             if self._tool_release_t is None:
                 self._tool_release_t = now
                 return
-            if now - self._tool_release_t < TOOL_RELEASE_HOLD:
+            if now - self._tool_release_t < hold:
                 return
             self._tool_held = False
             self._tool_release_t = None
@@ -1493,7 +1518,15 @@ def main():
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
+        # An episode in progress holds the whole accumulated mask in memory and
+        # writes it only when it ends, so shutting down without ending it threw
+        # the run away -- exactly the run someone is most likely to interrupt.
+        try:
+            ok, message = node._end_episode()
+            if ok:
+                node.get_logger().info(f"Interrupted -> {message}")
+        except Exception as e:
+            node.get_logger().error(f"Could not save on interrupt: {e}")
     finally:
         node.destroy_node()
         rclpy.shutdown()
