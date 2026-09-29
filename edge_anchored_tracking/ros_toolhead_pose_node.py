@@ -252,29 +252,19 @@ class ToolheadNode(Node):
 
         if self.tip_source in ("pose_seed", "pose_only"):
             self._load_calibration()
-            # Subscribe RELIABLE *and* BEST_EFFORT. An incompatible
-            # reliability pair delivers nothing and logs nothing, which is
-            # indistinguishable from a silent publisher; taking both removes
-            # the guess. _on_pose only stores the newest sample, so receiving
-            # the same message twice changes nothing.
-            # The visual-servoing smoother publishes
-            # PoseWithCovarianceStamped; other sources publish a plain
-            # PoseStamped. A subscription with the wrong type never connects
-            # and never logs, so subscribe with both and let whichever
-            # matches deliver -- the same reasoning as the reliability pair
-            # below. _on_pose reads only the position, which sits at a
-            # different depth in the two messages.
-            for msg_type in (PoseWithCovarianceStamped, PoseStamped):
-                for rel in (ReliabilityPolicy.RELIABLE,
-                            ReliabilityPolicy.BEST_EFFORT):
-                    self.create_subscription(
-                        msg_type, self.pose_topic, self._on_pose,
-                        QoSProfile(reliability=rel,
-                                   history=HistoryPolicy.KEEP_LAST, depth=1))
+            msg_type = self._resolve_pose_type()
+            # RELIABLE matches a reliable publisher exactly and still accepts
+            # a best-effort one, so one subscription covers both. (A second
+            # subscription to the same topic is not an option: ROS 2 refuses
+            # two with different types, and a duplicate adds nothing here.)
+            self.create_subscription(
+                PoseWithCovarianceStamped if msg_type == "cov" else PoseStamped,
+                self.pose_topic, self._on_pose,
+                QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                           history=HistoryPolicy.KEEP_LAST, depth=1))
             self.get_logger().info(
                 f"Tip source: {self.tip_source} from {self.pose_topic} "
-                f"(PoseStamped + PoseWithCovarianceStamped, "
-                f"reliable + best-effort)")
+                f"({'PoseWithCovarianceStamped' if msg_type == 'cov' else 'PoseStamped'})")
 
         self._tool_held = False        # last debounced button state
         self._tool_release_t = None    # when the button first read released
@@ -811,6 +801,39 @@ class ToolheadNode(Node):
             f"Calibration [{self.camera_model}] {path} ({stamp})  "
             f"{width}x{height}  fx={self.K[0, 0]:.1f} fy={self.K[1, 1]:.1f} "
             f"cx={self.K[0, 2]:.1f} cy={self.K[1, 2]:.1f}")
+
+    def _resolve_pose_type(self, timeout_s=5.0):
+        """Which message type the pose publisher offers: "cov" or "plain".
+
+        The type cannot be guessed. A subscription created with the wrong one
+        never connects and never logs, and ROS 2 will not allow a second
+        subscription to the same topic with the other type -- so the choice
+        has to be right the first time. The graph knows the answer; this is
+        the same information `ros2 topic info <topic>` prints.
+
+        The publisher may not have appeared yet when this node starts, so
+        wait briefly for it. If it never appears, assume the
+        covariance-stamped form the visual-servoing smoother publishes and
+        say so: the episode will then fail with the "no tip pose received"
+        message, which names the topic to check.
+        """
+        deadline = time.time() + timeout_s
+        want = self.pose_topic.lstrip("/")
+        while time.time() < deadline:
+            for name, types_ in self.get_topic_names_and_types():
+                if name.lstrip("/") != want:
+                    continue
+                for t in types_:
+                    if "PoseWithCovarianceStamped" in t:
+                        return "cov"
+                    if "PoseStamped" in t:
+                        return "plain"
+            time.sleep(0.1)
+        self.get_logger().warn(
+            f"{self.pose_topic} has no publisher after {timeout_s:.0f}s; "
+            f"assuming PoseWithCovarianceStamped. If the tip never seeds, "
+            f"check: ros2 topic info {self.pose_topic} --verbose")
+        return "cov"
 
     def _on_pose(self, msg):
         """Keep the newest tip pose. Projection happens per image frame.
