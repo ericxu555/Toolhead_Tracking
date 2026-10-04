@@ -317,6 +317,7 @@ class ToolheadNode(Node):
         self.tracker = None
         self.track_state = None
         self.tip_history = []          # raw tips, for the smoothing window
+        self.mask_tips = []            # smoothed tips the mask was built from
         self.cutline_x = None
         # Ordered trace of tip positions. cutline_x holds one x per image
         # row, which cannot represent sideways motion (successive samples
@@ -764,6 +765,7 @@ class ToolheadNode(Node):
         tx = float(np.mean([p[0] for p in w]))
         ty = float(np.mean([p[1] for p in w]))
 
+        self.mask_tips.append((tx, ty))
         self._update_mask(frame, (tx, ty))
         self._publish(frame, header, (tx, ty))
         self.n_processed += 1
@@ -1052,20 +1054,38 @@ class ToolheadNode(Node):
         if bound is not None:
             self.accum_mask &= bound
 
-        # KEEP ONLY THE REGION CONNECTED TO THE CUT. The resection grows from
-        # the cut path and stays attached to it, so a component touching no
-        # part of the cutline came from a bad frame. Accumulation is monotonic,
-        # so without this such a blob survives to the end of the episode.
+        # KEEP ONLY WHAT THE RESECTION PRODUCED. Accumulation is monotonic, so
+        # a region planted by a bad frame survives to the end unless it is
+        # removed.
+        #
+        # Which components the resection actually made is answered by the TIP'S
+        # OWN HISTORY: a resected region is one the tool was inside, a leftover
+        # is one the tool merely passed beside. Measured offline on
+        # failure_case2 -- main region 286 tips inside, second region 19, and
+        # every leftover sliver 0 tips at 10-39 px away.
+        #
+        # This replaces a probe taken at one x per image row from cutline_x,
+        # which failed two ways. cutline_x is overwritten latest-pass-wins, so a
+        # later cut crossing the same rows moved the probes off an earlier
+        # region and deleted it whole; and being per-row, what survived was a
+        # comb of one-column-per-row fragments. It also assumed the resection
+        # stays attached to the cut path, which is false once the tool leaves
+        # the tumor and re-enters elsewhere -- the second cut's region is
+        # legitimately a separate component, and connectivity is not tested
+        # here at all.
+        #
+        # Tip history is append-only, so nothing can move the anchor off a
+        # region already earned.
         n_lab, lab = cv2.connectedComponents(
             self.accum_mask.astype(np.uint8), connectivity=8)
         if n_lab > 2:
             keep = set()
-            for r in np.where(~np.isnan(self.cutline_x))[0]:
-                c = int(round(self.cutline_x[r]))
-                for off in (0, -2, 2, -5, 5):
-                    cc = c + off
-                    if 0 <= cc < W and lab[r, cc]:
-                        keep.add(int(lab[r, cc]))
+            for _tp in self.mask_tips:
+                _px = int(round(min(max(_tp[0], 0), W - 1)))
+                _py = int(round(min(max(_tp[1], 0), H - 1)))
+                _l = int(lab[_py, _px])
+                if _l:
+                    keep.add(_l)
             if keep:
                 self.accum_mask = np.isin(lab, list(keep))
 

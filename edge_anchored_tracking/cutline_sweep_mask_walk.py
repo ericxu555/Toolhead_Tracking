@@ -126,10 +126,14 @@ def largest_component(mask_bool):
     return mask_bool
 
 
-# Threshold for calling a pixel tumor. 0.6 rather than 0.5: the boundary-
-# weighted loss makes the model confident well inside the tumor and soft at
-# the rim, so the higher cut trims that halo without eating the body.
-MASK_THRESHOLD = 0.6
+# Threshold for calling a pixel tumor. 0.5, NOT the 0.6 tried earlier: at 0.6
+# the mask boundary pulls in, and outer_perimeter is the CONVEX HULL of T, so
+# the hull moves, the tangent at the tip moves with it, and the perpendicular
+# that sets the sweep direction can flip. Measured on failure_case1, changing
+# ONLY the threshold reproduced the whole defect -- 33,643 px against 31,165
+# at IoU 0.903, with a visibly counter-clockwise sweep -- while changing only
+# the checkpoint (IoU 0.993) or only the EMA (IoU 0.9994) did not.
+MASK_THRESHOLD = 0.5
 
 
 def tumor_mask_from_prob(prob):
@@ -139,10 +143,10 @@ def tumor_mask_from_prob(prob):
     unlabelled where the tissue is specular or blood-darkened, and those are
     not holes in the tumor.
 
-    Every connected region is KEPT. An earlier version kept only the largest,
-    which silently deleted a genuinely multi-focal tumor -- and on hazy frames,
-    where the model fragments one tumor into patches, it deleted most of the
-    real mask with it.
+    Every connected region is KEPT. Keeping only the largest silently deleted
+    a genuinely multi-focal tumor, and on hazy frames -- where the model
+    fragments one tumor into patches -- it deleted most of the real mask with
+    it.
     """
     m = prob > MASK_THRESHOLD
     if m.any():
@@ -1342,26 +1346,45 @@ def main():
             cv2.fillPoly(_bound, [perim.astype(np.int32).reshape(-1, 1, 2)], 1)
             accum_mask &= _bound.astype(bool)
 
-        # KEEP ONLY THE REGION CONNECTED TO THE CUT.
+        # KEEP ONLY WHAT THE RESECTION PRODUCED.
         #
-        # The resection grows outward from the cut path and stays attached to
-        # it, so any component not touching the cutline came from a bad frame.
-        # Accumulation is monotonic, so without this such a component survives
-        # to the end: measured on the screen-recording case, one frame planted
-        # a 5,461 px blob 90 px left of the mask and it persisted for the
-        # remaining 370 frames.
+        # Accumulation is monotonic, so a region planted by a bad frame survives
+        # to the end unless it is removed: measured on the screen-recording
+        # case, one frame planted a 5,461 px blob 90 px left of the mask and it
+        # persisted for the remaining 370 frames.
         #
-        # This fixes the outcome rather than guessing at the cause, so it has
-        # no thresholds and does not depend on tip position or frame timing.
+        # The question is which components the resection actually made, and the
+        # TIP'S OWN HISTORY answers it: a resected region is one the tool was
+        # inside, a leftover is one the tool merely passed beside. Measured on
+        # fc2's final mask -- main region 286 tips inside, second region 19,
+        # and every leftover sliver 0 tips at 10-39 px away. No overlap.
+        #
+        # This replaces a probe taken at one x per row from cutline_x, which
+        # failed two ways. cutline_x is overwritten latest-pass-wins, so a later
+        # cut crossing the same rows moved the probes off an earlier region and
+        # deleted it whole (the f581 wipe of the first re-entry's region); and
+        # being per-row, what survived was a comb of one-column-per-row
+        # fragments -- the vertical jagged strips at f570-578.
+        #
+        # It also drops the old rule's premise, that "the resection stays
+        # attached to the cut path". That is false once the tool leaves the
+        # tumor and re-enters elsewhere: the second cut's region is legitimately
+        # a separate component, and connectivity never enters this test.
+        #
+        # Tip history is append-only, so nothing can move the anchor off a
+        # region already earned.
         n_lab, lab = cv2.connectedComponents(accum_mask.astype(np.uint8), connectivity=8)
         if n_lab > 2:
             keep = set()
-            for r in np.where(~np.isnan(cutline_x))[0]:
-                c = int(round(cutline_x[r]))
-                for off in (0, -2, 2, -5, 5):
-                    cc = c + off
-                    if 0 <= cc < W and lab[r, cc]:
-                        keep.add(int(lab[r, cc]))
+            for _f in range(i + 1):
+                _p = tips.get(_f)
+                if _p is None:
+                    continue
+                _px = int(round(min(max(_p[0], 0), W - 1)))
+                _py = int(round(min(max(_p[1], 0), H - 1)))
+                _l = int(lab[_py, _px])
+                if _l:
+                    keep.add(_l)
             if keep:
                 accum_mask = np.isin(lab, list(keep))
         disp = accum_mask
