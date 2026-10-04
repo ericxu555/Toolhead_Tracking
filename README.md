@@ -1,4 +1,4 @@
-# Cutline-Sweep Resection Mask Pipeline
+﻿# Cutline-Sweep Resection Mask Pipeline
 
 Surgical tumor resection tracking from 2D endoscope video. The pipeline
 combines a per-frame binary tumor segmentation model with a tracked tool-tip
@@ -125,12 +125,12 @@ Two sets of weights are required for the basic setup. Neither is included in
 this repository because both exceed GitHub's file size limit.
 
 **4a. Tumor segmentation checkpoint.** Download both files from the link below
-and place them in `checkpoints_tumor_binary10/`:
+and place them in `checkpoints_tumor_binary11/`:
 
 > https://drive.google.com/drive/folders/18w_LTyrIgShmxdWPbZUZF8BunnrfqyQo?usp=sharing
 
 ```
-checkpoints_tumor_binary10/
+checkpoints_tumor_binary11/
   best_model_epoch_swa.pth
   best_model_epoch_swa_metadata.json
 ```
@@ -146,7 +146,7 @@ downloads itself to `~/.cache/tapnextpp/` on first run.
 After this step:
 
 ```
-checkpoints_tumor_binary10/  best_model_epoch_swa.pth, best_model_epoch_swa_metadata.json
+checkpoints_tumor_binary11/  best_model_epoch_swa.pth, best_model_epoch_swa_metadata.json
 checkpoints_keypoint/        keypoint_rcnn.onnx
 ```
 
@@ -226,8 +226,8 @@ working defaults.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `SPATIAL_MODEL` | `checkpoints_tumor_binary10/best_model_epoch_swa.pth` | Segmentation weights |
-| `SPATIAL_META` | `checkpoints_tumor_binary10/best_model_epoch_swa_metadata.json` | Segmentation metadata |
+| `SPATIAL_MODEL` | `checkpoints_tumor_binary11/best_model_epoch_swa.pth` | Segmentation weights |
+| `SPATIAL_META` | `checkpoints_tumor_binary11/best_model_epoch_swa_metadata.json` | Segmentation metadata |
 | `KEYPOINT_MODEL` | `checkpoints_keypoint/keypoint_rcnn.onnx` | Tool-tip detector |
 | `SAM2_SCRATCH` | System temp directory | Scratch space for SAM2 frame staging (refinement only) |
 
@@ -602,7 +602,7 @@ edge_anchored_tracking/
   render_cutline_only.py      cutline-only visualization, no mask fill
 tapnextpp_hybrid.py           tool-tip tracking (TAPNext++ with shaft fallback)
 click_tooltip_multi.py        GUI tool to seed the tip tracker manually
-checkpoints_tumor_binary10/   segmentation weights
+checkpoints_tumor_binary11/   segmentation weights
 checkpoints_keypoint/         keypoint_rcnn.onnx
 checkpoints_sam2/             SAM2 checkpoint
 requirements.txt
