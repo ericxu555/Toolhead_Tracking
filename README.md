@@ -585,6 +585,68 @@ python3 -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 Both must succeed from the same interpreter. The GPU build of ONNX Runtime is
 recommended here, as noted in Step 3.
 
+### Distance readout and experiment logging (`ros_toolhead_pose_node.py`)
+
+The published overlay shows `d = NN px` at the top left: the distance from
+the smoothed tip to the nearest point of the tumor's convex hull, in
+processing-frame (540) pixels, or `d = --` when there is no hull. It is drawn
+on the published image only; `final_overlay.png`, the mask and saved frames
+are unchanged. Turn it off with `-p show_distance_overlay:=false`.
+
+`-p experiment:=true` writes a session folder for offline analysis. It changes
+nothing the node computes -- `final_mask.png` is bit-identical with it on or
+off (`tools/offline_replay_test.py`).
+
+```bash
+python3 edge_anchored_tracking/ros_toolhead_pose_node.py --ros-args \
+    -p tip_source:=pose_only -p camera_model:=rect \
+    -p image_topic:=/ves_camera/image_rect -p trigger_mode:=tool \
+    -p experiment:=true \
+    -p tumor_id:=T01 -p condition:=overlay -p operator:=A -p trial:=1
+
+# between trials (read at the start of each episode)
+ros2 param set /toolhead_tracking tumor_id T02
+ros2 param set /toolhead_tracking show_distance_overlay false
+```
+
+```
+Output/session_<stamp>/
+  run_config.json      parameters, constants, checkpoint sha256, git commit,
+                       resize, calibration, ves_smoother params
+  calibration/         copy of the calibration YAML used
+  frames.csv           every frame received, IDLE included
+  events.csv           episodes, state changes, tool on/off edges, log drops
+  metadata.csv         one row per episode
+  episode_NNN_<stamp>/
+    final_mask.png ... the usual outputs, unchanged
+    meta.json          tumor_id, condition, operator, trial, overlay on/off
+    tips.csv           per frame: pose + covariance, raw/smoothed tip,
+                       hull and true-contour distance with nearest points,
+                       sweep endpoint, displayed text, warning state
+    raw/NNNNNN.png     every received frame at 540x540 (NNNNNN = frame_idx)
+    overlay.mp4        what was displayed; overlay_frames.csv maps frames
+    snapshots/         mask + tumor mask every 15 frames, final cutline
+    log_summary.json   frames saved, drops, GB/min
+```
+
+| Parameter | Default | Purpose |
+| --- | --- | --- |
+| `show_distance_overlay` | `true` | Draw the distance readout |
+| `warn_distance_px` | `0` | Readout turns red below this distance; 0 = never |
+| `experiment` | `false` | Write the session logs above |
+| `snapshot_every` | `15` | Mask snapshot interval, in tracked frames |
+| `raw_png_compression` | `1` | PNG level for raw frames (0-9; 1 is fast, lossless) |
+| `tumor_id`, `condition`, `operator`, `trial` | empty, `-1` | Episode metadata; `trial` < 0 numbers episodes in order |
+
+Supporting tools:
+
+```bash
+tools/record_session.sh                          # MCAP bag of the raw inputs
+python3 tools/check_session_logs.py Output/session_<stamp>
+python3 tools/label_tool.py Output/session_<stamp>/episode_001_<stamp> --stride 10
+python3 tools/export_bag_frames.py <bag> <out>   # bag -> 540x540 frames + mp4
+```
+
 ## Repository layout
 
 ```
@@ -595,6 +657,8 @@ src/                          segmentation model and inference engine
 edge_anchored_tracking/
   run_autonomous_toolhead.py  end-to-end driver for the automatic workflow
   ros_toolhead_node.py        ROS 2 node: same pipeline on a live camera topic
+  ros_toolhead_pose_node.py   ROS 2 node driven by the visual-servoing tip pose
+  experiment_log.py           -p experiment:=true session logging
   auto_seed_tip.py            automatic tip detection (keypoint_rcnn.onnx)
   refine_tip_with_sam2_v2.py  SAM2 two-pass refinement to the true distal tip
   auto_seed_tool.py           shared mask-quality helpers

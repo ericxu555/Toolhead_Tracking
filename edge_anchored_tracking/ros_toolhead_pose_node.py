@@ -43,6 +43,21 @@ Realtime policy
 Frames arriving while a frame is still being processed are dropped, so the
 overlay stays aligned with what the camera sees rather than falling behind.
 The node reports the drop rate on stop.
+
+Distance display
+----------------
+The published overlay carries "d = NN px" at the top left: the distance from
+the smoothed tip to the nearest point of the tumor's convex hull, the same
+point the sweep's edge is oriented from. Units are processing-frame pixels
+(proc_size, 540 by default). "--" when there is no hull to measure against.
+Drawn on the published copy only -- never on final_overlay.png, the mask, or
+any saved raw frame. -p show_distance_overlay:=false turns it off.
+
+Experiment logging
+------------------
+-p experiment:=true writes a session folder of per-frame logs, raw frames and
+the displayed video for offline analysis; see experiment_log.py. Off by
+default, and it changes nothing the node computes.
 """
 import os
 import sys
@@ -210,6 +225,24 @@ class ToolheadNode(Node):
         # stream. The two focal lengths differ by ~23% here, so this must
         # match whatever the image topic actually carries.
         self.declare_parameter("camera_model", "raw")
+        # Live tip-to-boundary distance on the published overlay. Read again at
+        # each episode start, so a study can switch it between trials with
+        # `ros2 param set`. warn_distance_px > 0 turns the readout red below
+        # that distance; 0 leaves it white.
+        self.declare_parameter("show_distance_overlay", True)
+        self.declare_parameter("warn_distance_px", 0.0)
+        # Experiment logging (experiment_log.py). Off by default: a normal run
+        # writes exactly what it always has.
+        self.declare_parameter("experiment", False)
+        self.declare_parameter("snapshot_every", 15)
+        self.declare_parameter("raw_png_compression", 1)
+        # Study metadata for the episode's meta.json, read at each episode
+        # start so it can be set per trial. trial < 0 numbers trials by
+        # episode order within the session.
+        self.declare_parameter("tumor_id", "")
+        self.declare_parameter("condition", "")
+        self.declare_parameter("operator", "")
+        self.declare_parameter("trial", -1)
 
         self.image_topic = self.get_parameter("image_topic").value
         self.output_root = self.get_parameter("output_root").value
@@ -237,6 +270,49 @@ class ToolheadNode(Node):
 
         self.declare_parameter("proc_size", PROC_SIZE)
         self.proc_size = int(self.get_parameter("proc_size").value)
+
+        self.show_distance_overlay = bool(
+            self.get_parameter("show_distance_overlay").value)
+        self.warn_distance_px = float(
+            self.get_parameter("warn_distance_px").value)
+        # Display and logging only: written by _update_mask, never read back
+        # by any tracking or mask step.
+        self.last_hull_pt = None       # nearest hull point to the tip
+        self.last_hull_dist = None     # its distance, processing px
+        self.last_seg_end = None       # where this frame's sweep edge ended
+        self.last_T = None             # this frame's tumor mask
+        self.last_perim = None         # this frame's hull perimeter
+        self.last_d_text = ""
+        self.last_warn_state = ""
+        self.last_pose_cov = None      # experiment log only
+        self._xrec = None              # experiment-log record of this frame
+        self._xlog_res_done = False
+
+        # LOG ONLY. The projection model must match the stream: the smoother
+        # projects through camera_info.P (rectified), so /ves_camera/image_rect
+        # pairs with camera_model:=rect. The topic name is the only hint
+        # available here, so this warns and changes nothing.
+        if self.tip_source != "detector":
+            topic_rect = "rect" in str(self.image_topic).lower()
+            if topic_rect != (self.camera_model == "rect"):
+                self.get_logger().warn(
+                    f"camera_model={self.camera_model} but image_topic="
+                    f"{self.image_topic} looks "
+                    f"{'rectified' if topic_rect else 'unrectified'}. The "
+                    f"projected tip will be offset if these disagree. "
+                    f"(Warning only; nothing is changed.)")
+
+        self.xlog = None
+        if bool(self.get_parameter("experiment").value):
+            from experiment_log import ExperimentLog
+            self.xlog = ExperimentLog(
+                self.output_root,
+                lambda: self.get_clock().now().nanoseconds,
+                self.get_logger(), G.contour_of,
+                snapshot_every=int(self.get_parameter("snapshot_every").value),
+                png_level=int(self.get_parameter("raw_png_compression").value))
+            self.get_logger().info(
+                f"Experiment logging ON -> {self.xlog.session_dir}")
 
         # Keep only the newest frame, so a slow processing pass cannot build a
         # backlog that delays the overlay. RELIABLE matches the autocropper
@@ -306,6 +382,13 @@ class ToolheadNode(Node):
         else:
             self.get_logger().info(
                 "Trigger: /toolhead/start and /toolhead/stop services.")
+            if self.xlog is not None:
+                # Record the tool signal even when it does not drive episodes.
+                # This callback only logs; it cannot start or stop anything.
+                self.create_subscription(
+                    JointState, self.tool_topic, self._xlog_on_joint,
+                    QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                               history=HistoryPolicy.KEEP_LAST, depth=1))
 
         self.state = IDLE
         self.lock = threading.Lock()
@@ -321,6 +404,8 @@ class ToolheadNode(Node):
         self.get_logger().info("Loading models...")
         self._load_models()
         self.get_logger().info("Models loaded.")
+        if self.xlog is not None:
+            self._xlog_config()
 
         self.create_subscription(Image, self.image_topic, self._on_image, qos)
         self.get_logger().info(
@@ -451,14 +536,16 @@ class ToolheadNode(Node):
         self.t_start = None
 
     def _on_start(self, request, response):
-        ok, msg = self._begin_episode()
+        ok, msg = self._begin_episode(source="service")
         response.success = ok
         response.message = msg
         return response
 
-    def _begin_episode(self):
+    def _begin_episode(self, source="service"):
         """Start an episode. Shared by the /toolhead/start service and by the
         tool-button trigger, so both paths run identical logic."""
+        # An experiment session keeps its episodes inside its own folder.
+        root = self.xlog.session_dir if self.xlog is not None else self.output_root
         with self.lock:
             if self.state != IDLE:
                 return False, f"Already running (state={self.state}). Call stop first."
@@ -467,15 +554,35 @@ class ToolheadNode(Node):
             # Count only existing episode directories. The conditional must
             # guard the listdir alone: written as a trailing if/else on the
             # whole expression it binds to `1 + len(...)`, which is wrong.
-            existing = ([d for d in os.listdir(self.output_root)
+            existing = ([d for d in os.listdir(root)
                          if d.startswith("episode_")]
-                        if os.path.isdir(self.output_root) else [])
+                        if os.path.isdir(root) else [])
             n = len(existing) + 1
-            self.episode_dir = os.path.join(self.output_root, f"episode_{n:03d}_{stamp}")
+            self.episode_dir = os.path.join(root, f"episode_{n:03d}_{stamp}")
             os.makedirs(self.episode_dir, exist_ok=True)
             self.state = SEEDING
             self.n_received = self.n_processed = self.n_dropped = 0
             self.t_start = time.time()
+        self.show_distance_overlay = bool(
+            self.get_parameter("show_distance_overlay").value)
+        self.warn_distance_px = float(
+            self.get_parameter("warn_distance_px").value)
+        if self.xlog is not None:
+            trial = int(self.get_parameter("trial").value)
+            self.xlog.episode_begin(self.episode_dir, {
+                "tumor_id": str(self.get_parameter("tumor_id").value),
+                "condition": str(self.get_parameter("condition").value),
+                "operator": str(self.get_parameter("operator").value),
+                "trial": trial if trial >= 0 else n,
+                "trial_from_param": trial >= 0,
+                "overlay_on": self.show_distance_overlay,
+                "show_distance_overlay": self.show_distance_overlay,
+                "warn_distance_px": self.warn_distance_px,
+                "trigger_mode": self.trigger_mode,
+                "trigger_source": source,
+                "tip_source": self.tip_source,
+                "episode_dir": self.episode_dir,
+            })
         self.get_logger().info(f"Episode started -> {self.episode_dir}")
         # Seeding is driven entirely by the image callback, so if the camera is
         # not publishing the node waits in silence with nothing on the overlay.
@@ -510,6 +617,9 @@ class ToolheadNode(Node):
             return
 
         held = float(msg.position[idx]) >= TOOL_PRESSED
+        if self.xlog is not None:
+            self.xlog.tool_signal(held, float(msg.position[idx]),
+                                  msg.header.stamp, "trigger")
 
         if not self._tool_seen:
             self._tool_seen = True
@@ -538,7 +648,7 @@ class ToolheadNode(Node):
             self._tool_release_t = None
             if not self._tool_held:
                 self._tool_held = True
-                ok, message = self._begin_episode()
+                ok, message = self._begin_episode(source=self.trigger_mode)
                 self.get_logger().info(f"Tool pressed -> {message}")
             return
 
@@ -557,7 +667,7 @@ class ToolheadNode(Node):
                 return
             self._tool_held = False
             self._tool_release_t = None
-            ok, message = self._end_episode()
+            ok, message = self._end_episode(source=self.trigger_mode)
             self.get_logger().info(f"Tool released -> {message}")
 
     def _warn_if_no_frames(self):
@@ -573,12 +683,12 @@ class ToolheadNode(Node):
                 f"Is the camera publishing? Check with: ros2 topic hz {self.image_topic}")
 
     def _on_stop(self, request, response):
-        ok, msg = self._end_episode()
+        ok, msg = self._end_episode(source="service")
         response.success = ok
         response.message = msg
         return response
 
-    def _end_episode(self):
+    def _end_episode(self, source="service"):
         """End an episode and write its outputs. Shared by the /toolhead/stop
         service and by the tool-button trigger."""
         with self.lock:
@@ -593,10 +703,20 @@ class ToolheadNode(Node):
         if state_was == SEEDING or self.accum_mask is None:
             msg = "Stopped during seeding; no mask was produced."
             self.get_logger().warn(msg)
+            if self.xlog is not None:
+                self.xlog.episode_end(f"stopped_during_seeding ({source})")
             self._reset_episode_state()
             return True, msg
 
         paths = self._write_episode_outputs()
+        if self.xlog is not None:
+            self.xlog.episode_end(source, outputs={
+                "accum": self.accum_mask, "T": self.last_T,
+                "cutline_x": (None if self.cutline_x is None
+                              else self.cutline_x.copy()),
+                "cut_path": list(self.cut_path),
+                "tip_history": list(self.tip_history),
+                "mask_tips": list(self.mask_tips)})
         dt = time.time() - self.t_start
         summary = (f"Episode ended. {self.n_processed} frames processed, "
                    f"{self.n_dropped} dropped, {dt:.1f}s. Wrote: {paths}")
@@ -646,15 +766,26 @@ class ToolheadNode(Node):
 
     def _on_image(self, msg):
         self.n_received += 1
+        # Experiment log: every received frame gets a frames.csv row, IDLE
+        # included. Only enqueues; the writing happens on other threads.
+        xl = self.xlog
+        rec = xl.frame_begin(msg.header) if xl is not None else None
         with self.lock:
             if self.state == IDLE:
+                if rec is not None:
+                    xl.frame_end(rec, IDLE)
                 return
             if self.busy:
                 # Stay live rather than queueing: the newest frame matters more
                 # than completeness for an overlay the surgeon is watching.
                 self.n_dropped += 1
+                if rec is not None:
+                    xl.raw_frame(rec, msg, convert=self._xlog_convert)
+                    xl.frame_end(rec, self.state, dropped="busy")
                 return
             self.busy = True
+            state_in = self.state
+        self._xrec = rec
         try:
             native = self._to_bgr(msg)
             self.native_hw = native.shape[:2]
@@ -665,14 +796,23 @@ class ToolheadNode(Node):
                                    interpolation=cv2.INTER_AREA)
             else:
                 frame = native
+            if rec is not None:
+                xl.raw_frame(rec, frame)
+                if not self._xlog_res_done:
+                    self._xlog_res_done = True
+                    xl.write_config({"resize": self._xlog_resize_info(native)})
             if self.state == SEEDING:
                 self._step_seeding(frame, msg.header)
             elif self.state == TRACKING:
                 self._step_tracking(frame, msg.header)
         except Exception as e:  # never let one bad frame kill the node
             self.get_logger().error(f"Frame failed: {e}")
+            if rec is not None:
+                xl.event("frame_failed", str(e))
         finally:
             self.busy = False
+            if rec is not None:
+                self._xlog_frame_done(rec, state_in)
 
     def _to_bgr(self, msg):
         """Convert sensor_msgs/Image to BGR without requiring cv_bridge."""
@@ -711,6 +851,8 @@ class ToolheadNode(Node):
         cv2.rectangle(vis, (0, 0), (vis.shape[1], 30), (0, 0, 0), -1)
         cv2.putText(vis, text, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                     (255, 255, 255), 1, cv2.LINE_AA)
+        if self.xlog is not None:
+            self.xlog.overlay_frame(self._xrec, vis, "status")
 
         nh, nw = getattr(self, "native_hw", vis.shape[:2])
         if (nh, nw) != vis.shape[:2]:
@@ -873,6 +1015,12 @@ class ToolheadNode(Node):
         pos = getattr(inner, "pose", inner).position
         self.last_pose = (float(pos.x), float(pos.y), float(pos.z))
         self.last_pose_stamp = msg.header.stamp
+        if self.xlog is not None:
+            # Logged, still not used: 6x6, GTSAM order (rotation block first,
+            # then position), camera frame.
+            cov = getattr(inner, "covariance", None)
+            self.last_pose_cov = (None if cov is None
+                                  else np.array(cov, dtype=np.float64))
         self.n_pose += 1
         if self.n_pose == 1:
             self.get_logger().info(
@@ -1112,6 +1260,9 @@ class ToolheadNode(Node):
             tip = self._project_tip()
             if tip is None:
                 self._publish_status(frame, header, "TRACKING  no tip pose")
+                if self.xlog is not None:
+                    self._xlog_tip(None, None,
+                                   reject=self._xlog_reject_reason())
                 return
             dt = float("nan")
             if self.last_pose_stamp is not None and header.stamp is not None:
@@ -1129,6 +1280,8 @@ class ToolheadNode(Node):
             self.mask_tips.append((tx, ty))
             self._update_mask(frame, (tx, ty))
             self._publish(frame, header, (tx, ty))
+            if self.xlog is not None:
+                self._xlog_tip(tip, (tx, ty))
             self.n_processed += 1
             return
 
@@ -1164,6 +1317,8 @@ class ToolheadNode(Node):
         self.mask_tips.append((tx, ty))
         self._update_mask(frame, (tx, ty))
         self._publish(frame, header, (tx, ty))
+        if self.xlog is not None:
+            self._xlog_tip(tip, (tx, ty), visible=visible)
         self.n_processed += 1
 
     def _update_mask(self, frame_bgr, tip_xy):
@@ -1215,8 +1370,16 @@ class ToolheadNode(Node):
                 self.cut_start_y = tyi
 
         perp_dir = None
+        # The nearest hull point and its distance have always come back from
+        # this call; they are now kept for the distance readout and the
+        # experiment log. Nothing in the mask construction reads them.
+        hull_pt = hull_dist = None
         if perim is not None and len(perim) >= 40:
-            self.last_angle_deg, perp_dir, _, _ = G.perp_direction_at_tip(perim, (tx, ty))
+            self.last_angle_deg, perp_dir, hull_pt, hull_dist = \
+                G.perp_direction_at_tip(perim, (tx, ty))
+        self.last_hull_pt, self.last_hull_dist = hull_pt, hull_dist
+        self.last_T, self.last_perim = T, perim
+        self.last_seg_end = None
 
         frame_mask = np.zeros((H, W), dtype=bool)
         if self.frontier_y >= 0 and perim is not None and perp_dir is not None:
@@ -1327,6 +1490,7 @@ class ToolheadNode(Node):
                             self.prev_seg_len = sl_now
                     else:
                         self.seg_vetoed = 0
+                self.last_seg_end = seg_end      # logging only
                 if seg_end is not None:
                     # Contiguous PREFIX of the trace, never a filter: dropping
                     # scattered points splices non-neighbours together and puts
@@ -1498,16 +1662,27 @@ class ToolheadNode(Node):
         self.last_frame = frame_bgr
         self.last_overlay = vis
 
+        # Distance readout, drawn on a COPY: final_overlay.png (last_overlay
+        # above), the mask and every saved frame stay exactly as before.
+        self.last_d_text, self.last_warn_state = self._distance_label()
+        shown = vis
+        if self.show_distance_overlay:
+            shown = vis.copy()
+            self._draw_distance(shown, self.last_d_text,
+                                self.last_warn_state == "warn")
+        if self.xlog is not None:
+            self.xlog.overlay_frame(self._xrec, shown, "tracking")
+
         # Publish at the camera's native resolution so the overlay lines up
         # with the raw stream in RViz and for any downstream consumer.
         nh, nw = getattr(self, "native_hw", (vis.shape[0], vis.shape[1]))
         scale = nw / float(self.W)
         if (nh, nw) != vis.shape[:2]:
-            pub_vis = cv2.resize(vis, (nw, nh), interpolation=cv2.INTER_LINEAR)
+            pub_vis = cv2.resize(shown, (nw, nh), interpolation=cv2.INTER_LINEAR)
             pub_mask = cv2.resize(disp.astype(np.uint8) * 255, (nw, nh),
                                   interpolation=cv2.INTER_NEAREST)
         else:
-            pub_vis, pub_mask = vis, disp.astype(np.uint8) * 255
+            pub_vis, pub_mask = shown, disp.astype(np.uint8) * 255
 
         self.pub_overlay.publish(self._to_msg(pub_vis, header, "bgr8"))
         if self.pub_mask is not None:
@@ -1520,6 +1695,223 @@ class ToolheadNode(Node):
             pt.point.y = float(tip_xy[1]) * scale
             pt.point.z = 0.0
             self.pub_tip.publish(pt)
+
+    # ------------------------------------------------- distance readout
+
+    def _distance_label(self):
+        """("d = NN px" or "d = --", warn state) for this frame's hull
+        distance. The number is round(last_hull_dist), the same value the
+        experiment log records as hull_dist_px."""
+        d = self.last_hull_dist
+        if d is None or not np.isfinite(d):
+            return "d = --", "invalid"
+        text = f"d = {int(round(d))} px"
+        if self.warn_distance_px > 0:
+            return text, ("warn" if d < self.warn_distance_px else "ok")
+        return text, "off"
+
+    @staticmethod
+    def _draw_distance(img, text, warn):
+        font, fs, th = cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+        (tw, tht), base = cv2.getTextSize(text, font, fs, th)
+        cv2.rectangle(img, (4, 4), (4 + tw + 10, 4 + tht + base + 10),
+                      (0, 0, 0), -1)
+        cv2.putText(img, text, (9, 9 + tht), font, fs,
+                    (0, 0, 255) if warn else (255, 255, 255), th, cv2.LINE_AA)
+
+    # ------------------------------------------------- experiment logging
+    # Everything below runs only with -p experiment:=true. Each method reads
+    # node state and hands it to experiment_log.ExperimentLog; none of them
+    # writes back to anything tracking or the mask uses.
+
+    def _xlog_on_joint(self, msg):
+        """Service mode: record the tool signal without acting on it."""
+        try:
+            idx = list(msg.name).index(TOOL_JOINT_NAME)
+        except ValueError:
+            return
+        if idx < len(msg.position):
+            v = float(msg.position[idx])
+            self.xlog.tool_signal(v >= TOOL_PRESSED, v, msg.header.stamp,
+                                  "log_only")
+
+    def _xlog_convert(self, msg):
+        """A raw message as the processing frame, for a frame that was
+        dropped before conversion. Runs on a writer thread."""
+        native = self._to_bgr(msg)
+        if native.shape[0] != self.proc_size or native.shape[1] != self.proc_size:
+            return cv2.resize(native, (self.proc_size, self.proc_size),
+                              interpolation=cv2.INTER_AREA)
+        return native
+
+    def _xlog_resize_info(self, native):
+        nh, nw = native.shape[:2]
+        return {"native_hw": [int(nh), int(nw)],
+                "proc_hw": [self.proc_size, self.proc_size],
+                "scale_native_per_proc": [nh / float(self.proc_size),
+                                          nw / float(self.proc_size)],
+                "crop": "none (full frame)",
+                "offset_px": [0, 0],
+                "method": "cv2.resize INTER_AREA",
+                "native_is_proc": bool(nh == self.proc_size
+                                       and nw == self.proc_size)}
+
+    def _xlog_frame_done(self, rec, state_in):
+        xl = self.xlog
+        state_after = self.state
+        xl.frame_end(rec, state_in, state_after, processed=True)
+        if state_after != state_in:
+            xl.event("state", f"{state_in}->{state_after}", rec["stamp"])
+            # Seeding gave up and set IDLE itself, without _end_episode.
+            if state_after == IDLE and xl.episode is not None:
+                xl.episode_end("seeding_failed")
+        self._xrec = None
+
+    def _xlog_reject_reason(self):
+        """Why _project_tip returned None, by the same tests it applies."""
+        if self.last_pose is None:
+            return "no_pose"
+        if self.K is None:
+            return "no_calibration"
+        if self.last_pose[2] <= 1e-6:
+            return "z_nonpositive"
+        return "off_frame"
+
+    def _xlog_tip(self, tip_raw, tip_smooth, reject="", visible=None):
+        ok = tip_smooth is not None
+        vis_flag = None
+        if visible is not None:
+            try:
+                vis_flag = bool(np.asarray(visible).ravel()[0])
+            except Exception:
+                vis_flag = None
+        pose_sub = self.tip_source in ("pose_seed", "pose_only")
+        self.xlog.tip(self._xrec, {
+            "tip_source": self.tip_source,
+            "tip_raw": (None if tip_raw is None
+                        else (float(tip_raw[0]), float(tip_raw[1]))),
+            "tip_smooth": tip_smooth,
+            "reject_reason": reject,
+            "tracker_visible": vis_flag,
+            "pose_subscribed": pose_sub,
+            "pose": self.last_pose if pose_sub else None,
+            "pose_stamp": self.last_pose_stamp if pose_sub else None,
+            "pose_msgs_total": self.n_pose if pose_sub else None,
+            "cov": self.last_pose_cov if pose_sub else None,
+            "K": self.K, "dist": self.dist, "calib_wh": self.calib_wh,
+            "WH": (self.W, self.H),
+            "hull_dist": self.last_hull_dist if ok else None,
+            "hull_pt": self.last_hull_pt if ok else None,
+            "perim": self.last_perim if ok else None,
+            "T": self.last_T if ok else None,
+            "seg_end": self.last_seg_end if ok else None,
+            "angle_deg": self.last_angle_deg if ok else None,
+            "accum": self.accum_mask if ok else None,
+            "accum_px": int(self.accum_mask.sum()) if ok else None,
+            "overlay_on": self.show_distance_overlay,
+            "d_shown": (self.last_d_text
+                        if ok and self.show_distance_overlay else ""),
+            "warn_px": self.warn_distance_px,
+            "warn_state": self.last_warn_state if ok else "",
+        })
+
+    def _xlog_config(self):
+        """run_config.json: everything needed to reproduce the session."""
+        import socket
+        xl = self.xlog
+        try:
+            params = {n: p.value for n, p in self._parameters.items()}
+        except Exception:
+            params = {}
+        calib = None
+        if self.calib_path:
+            try:
+                calib = xl.copy_calibration(self.calib_path)
+            except Exception as e:
+                calib = {"original_path": self.calib_path, "error": str(e)}
+        xl.write_config({
+            "session": xl.session_name,
+            "created": datetime.now().isoformat(),
+            "host": socket.gethostname(),
+            "node_file": os.path.abspath(__file__),
+            "argv": list(sys.argv),
+            "params": params,
+            "constants": {
+                "TIP_SMOOTH": TIP_SMOOTH, "MASK_EMA": MASK_EMA,
+                "DILATE": DILATE, "PROC_SIZE": PROC_SIZE,
+                "SEED_MAX_FRAMES": SEED_MAX_FRAMES,
+                "SEED_MIN_VOTES": SEED_MIN_VOTES,
+                "MASK_THRESHOLD": getattr(G, "MASK_THRESHOLD", None),
+                "ARC_MIN_SAMPLES": getattr(G, "ARC_MIN_SAMPLES", None),
+                "ARC_SIDE_MARGIN": getattr(G, "ARC_SIDE_MARGIN", None),
+                "ARC_FRAC": getattr(G, "ARC_FRAC", None),
+                "hull_dist_min_perimeter_pts": 40,
+            },
+            "image": {
+                "topic": self.image_topic,
+                "qos": "RELIABLE, KEEP_LAST, depth 1",
+                "executor": "rclpy.spin (single-threaded)",
+                "note": ("Frames arriving while one is processed are "
+                         "overwritten in the depth-1 queue before this node "
+                         "sees them, so they never reach frames.csv. "
+                         "Upstream drops show only as stamp gaps; the bag "
+                         "has every frame."),
+            },
+            "resize": {"proc_hw": [self.proc_size, self.proc_size],
+                       "native_hw": "filled in on the first frame"},
+            "pose": {
+                "tip_source": self.tip_source, "topic": self.pose_topic,
+                "camera_model": self.camera_model,
+                "K_used": None if self.K is None else self.K.tolist(),
+                "dist_used": (None if self.dist is None
+                              else self.dist.ravel().tolist()),
+                "calib_wh": self.calib_wh,
+                "calibration": calib,
+                "covariance_layout": ("6x6 row-major, GTSAM order: rows/cols "
+                                      "0-2 rotation (rad^2), 3-5 position "
+                                      "(m^2), camera frame"),
+            },
+            "trigger": {
+                "mode": self.trigger_mode, "topic": self.tool_topic,
+                "joint": TOOL_JOINT_NAME, "pressed_threshold": TOOL_PRESSED,
+                "release_hold_s": TOOL_RELEASE_HOLD,
+                "autonomous_idle_timeout_s": self.autonomous_idle,
+                "note": ("events.csv tool_on/tool_off are raw edges of this "
+                         "joint. It is the Virtuoso's cut button; whether it "
+                         "is the cautery pedal itself is not established by "
+                         "this code."),
+            },
+            "distance": {
+                "definition": ("tip_smooth to nearest point of the tumor's "
+                               "convex hull (G.outer_perimeter), from "
+                               "G.perp_direction_at_tip -- the point the "
+                               "sweep edge is oriented from; unsigned; "
+                               "processing px"),
+                "contour_definition": ("tip_smooth to nearest point of the "
+                                       "largest external contour of the tumor "
+                                       "mask (G.contour_of), processing px"),
+            },
+            "margin_model": "not loaded by this node",
+            "logging": {
+                "raw": "PNG, processing frame, compression level "
+                       f"{int(self.get_parameter('raw_png_compression').value)}",
+                "snapshot_every": int(self.get_parameter("snapshot_every").value),
+            },
+        })
+        tap = os.path.join(os.path.expanduser("~"), ".cache", "tapnextpp",
+                           "tapnextpp_512.ckpt")
+        kp = os.environ.get("KEYPOINT_MODEL",
+                            os.path.join(REPO_ROOT, "checkpoints_keypoint",
+                                         "keypoint_rcnn.onnx"))
+        xl.gather_background({
+            "stage1_tumor_model": G.SPATIAL_MODEL,
+            "stage1_tumor_meta": G.SPATIAL_META,
+            "keypoint_rcnn": kp if self.tip_source == "detector" else None,
+            "tapnextpp": tap if self.tip_source != "pose_only" else None,
+        }, REPO_ROOT)
+        xl.event("session_start",
+                 f"tip_source={self.tip_source} trigger={self.trigger_mode} "
+                 f"camera_model={self.camera_model}")
 
     def _to_msg(self, img, header, encoding):
         msg = Image()
@@ -1543,12 +1935,14 @@ def main():
         # writes it only when it ends, so shutting down without ending it threw
         # the run away -- exactly the run someone is most likely to interrupt.
         try:
-            ok, message = node._end_episode()
+            ok, message = node._end_episode(source="ctrl_c")
             if ok:
                 node.get_logger().info(f"Interrupted -> {message}")
         except Exception as e:
             node.get_logger().error(f"Could not save on interrupt: {e}")
     finally:
+        if getattr(node, "xlog", None) is not None:
+            node.xlog.close()
         node.destroy_node()
         rclpy.shutdown()
 
