@@ -239,7 +239,9 @@ def check_episode(edir, frames, R):
         shown = [t for t in tips if t["overlay_on"] == "1" and t["tip_valid"] == "1"]
         bad = 0
         for t in shown:
-            if t["hull_valid"] == "1" and t["hull_dist_px"] != "":
+            if t["hull_valid"] == "1" and t.get("hull_dist_mm", "") != "":
+                want = f"d = {float(t['hull_dist_mm']):.1f} mm"
+            elif t["hull_valid"] == "1" and t["hull_dist_px"] != "":
                 want = f"d = {int(round(float(t['hull_dist_px'])))} px"
             else:
                 want = "d = --"
@@ -247,9 +249,9 @@ def check_episode(edir, frames, R):
                 bad += 1
         if shown:
             if bad:
-                R.err(f"d_shown disagrees with hull_dist_px on {bad}/{len(shown)} frames")
+                R.err(f"d_shown disagrees with the logged hull distance on {bad}/{len(shown)} frames")
             else:
-                R.ok(f"d_shown == round(hull_dist_px) on all {len(shown)} displayed frames")
+                R.ok(f"d_shown == the logged hull distance (mm, else px) on all {len(shown)} displayed frames")
         hv = np.array([float(t["hull_dist_px"]) for t in valid
                        if t["hull_dist_px"] != ""] or [np.nan])
         cv = np.array([float(t["contour_dist_px"]) for t in valid

@@ -91,6 +91,11 @@ class Trigger:
     pass
 
 
+class String:
+    def __init__(self):
+        self.data = ""
+
+
 class _Param:
     def __init__(self, v):
         self.value = v
@@ -205,6 +210,8 @@ def install_stubs():
     mod("geometry_msgs")
     mod("geometry_msgs.msg", PointStamped=PointStamped, PoseStamped=PoseStamped,
         PoseWithCovarianceStamped=PoseWithCovarianceStamped)
+    mod("std_msgs")
+    mod("std_msgs.msg", String=String)
     mod("std_srvs")
     mod("std_srvs.srv", Trigger=Trigger)
 

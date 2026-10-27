@@ -82,7 +82,7 @@ TIPS_COLS = [
     # tips, processing-frame pixels (proc_size space)
     "tip_raw_u", "tip_raw_v", "tip_smooth_u", "tip_smooth_v",
     # distance to the convex hull: the boundary the sweep's edge is cast to
-    "hull_valid", "hull_dist_px", "hull_u", "hull_v", "tip_in_hull",
+    "hull_valid", "hull_dist_px", "hull_dist_mm", "hull_u", "hull_v", "tip_in_hull",
     # distance to the true (non-hull) tumor contour
     "contour_valid", "contour_dist_px", "contour_u", "contour_v",
     "tip_in_contour", "tip_on_tumor",
@@ -90,7 +90,7 @@ TIPS_COLS = [
     "seg_end_u", "seg_end_v", "sweep_len_px", "angle_deg",
     "tumor_px", "accum_px",
     # display
-    "overlay_on", "d_shown", "warn_px", "warn_state",
+    "overlay_on", "d_shown", "warn_px", "warn_mm", "warn_state",
     "proc_ms",
 ]
 
@@ -693,6 +693,7 @@ class ExperimentLog:
         r["hull_valid"] = int(hd is not None)
         if hd is not None and sm is not None:
             r["hull_dist_px"] = _f(hd, 6)
+            r["hull_dist_mm"] = _f(info.get("hull_dist_mm"), 6)
             r["hull_u"], r["hull_v"] = _f(hp[0]), _f(hp[1])
             if perim is not None and len(perim) >= 3:
                 r["tip_in_hull"] = int(cv2.pointPolygonTest(
@@ -731,6 +732,7 @@ class ExperimentLog:
         r["overlay_on"] = int(bool(info.get("overlay_on")))
         r["d_shown"] = info.get("d_shown", "")
         r["warn_px"] = _f(info.get("warn_px"), 1)
+        r["warn_mm"] = _f(info.get("warn_mm"), 2)
         r["warn_state"] = info.get("warn_state", "")
 
         w = self._writers.get("tips")

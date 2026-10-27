@@ -1,0 +1,2 @@
+# The UI's only addition to the repository's requirements.txt (numpy and OpenCV come from there).
+PySide6>=6.6

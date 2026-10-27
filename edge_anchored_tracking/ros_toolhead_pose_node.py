@@ -15,6 +15,7 @@ existing file in the repository is modified by adding this node.
     Publishes   /toolhead/overlay            sensor_msgs/Image   mask on the live frame
                 /toolhead/mask               sensor_msgs/Image   mono8, 255 = resected
                 /toolhead/tip                geometry_msgs/PointStamped
+                /toolhead/status             std_msgs/String     JSON readouts for the operator UI
     Services    /toolhead/start              std_srvs/srv/Trigger
                 /toolhead/stop               std_srvs/srv/Trigger
 
@@ -49,7 +50,16 @@ Distance display
 The published overlay carries "d = NN px" at the top left: the distance from
 the smoothed tip to the nearest point of the tumor's convex hull, the same
 point the sweep's edge is oriented from. Units are processing-frame pixels
-(proc_size, 540 by default). "--" when there is no hull to measure against.
+(proc_size, 540 by default). With a visual-servoing tip it reads "d = N.N mm"
+instead: the pixel distance times the tip depth over the focal length, so it is
+exact only at the tip's depth. "--" when there is no hull to measure against.
+
+Between cuts
+------------
+IDLE frames are no longer ignored: the live frame is published on the overlay,
+the tumor is segmented to keep a baseline for the resected fraction, and after
+a release the final fraction is measured once the tip has left the tumor (see
+BASELINE_FRAMES). The calibration is re-read at every press.
 Drawn on the published copy only -- never on final_overlay.png, the mask, or
 any saved raw frame. -p show_distance_overlay:=false turns it off.
 
@@ -65,6 +75,7 @@ import time
 import json
 import tempfile
 import threading
+from collections import deque
 from datetime import datetime
 
 import numpy as np
@@ -76,6 +87,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Image, JointState
 from geometry_msgs.msg import (PointStamped, PoseStamped,
                                PoseWithCovarianceStamped)
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -192,6 +204,21 @@ PROC_SIZE = 540
 
 IDLE, SEEDING, TRACKING = "idle", "seeding", "tracking"
 
+# Resected-fraction display (published on /toolhead/status for the operator UI).
+# Between cuts the node keeps segmenting the tumor: a rolling average of the
+# last BASELINE_FRAMES frames with the tool out of view is the baseline T0,
+# frozen when the button is pressed. During the cut the fraction is an
+# ESTIMATE, |A ∩ T0| / |T0|, approximate because the tumor deforms. After the
+# release, once the tip has left the tumor, FINAL_FRAMES frames are averaged
+# into T_end and the FINAL fraction is |A| / (|A| + |T_end \ A|), measured with
+# nothing blocking the view. If the tip never leaves within FINAL_TIMEOUT the
+# estimate stands. Display and logging only: nothing here feeds the mask.
+BASELINE_FRAMES = 5
+FINAL_FRAMES = 5
+FINAL_TIMEOUT = 5.0       # seconds after release
+FRAC_BASELINE, FRAC_BLOCKED, FRAC_READY = "baseline", "blocked", "ready"
+FRAC_ESTIMATE, FRAC_FINAL, FRAC_NONE = "estimate", "final", "none"
+
 
 class ToolheadNode(Node):
 
@@ -231,6 +258,10 @@ class ToolheadNode(Node):
         # that distance; 0 leaves it white.
         self.declare_parameter("show_distance_overlay", True)
         self.declare_parameter("warn_distance_px", 0.0)
+        # With a visual-servoing tip the distance is also reported in mm (tip
+        # depth from the pose, focal length from the calibration), and this
+        # threshold replaces warn_distance_px. 0 disables the warning.
+        self.declare_parameter("warn_distance_mm", 2.0)
         # Experiment logging (experiment_log.py). Off by default: a normal run
         # writes exactly what it always has.
         self.declare_parameter("experiment", False)
@@ -275,10 +306,21 @@ class ToolheadNode(Node):
             self.get_parameter("show_distance_overlay").value)
         self.warn_distance_px = float(
             self.get_parameter("warn_distance_px").value)
+        self.warn_distance_mm = float(
+            self.get_parameter("warn_distance_mm").value)
         # Display and logging only: written by _update_mask, never read back
         # by any tracking or mask step.
         self.last_hull_pt = None       # nearest hull point to the tip
         self.last_hull_dist = None     # its distance, processing px
+        self.last_hull_dist_mm = None  # the same in mm, when a pose gives the depth
+        # Resected fraction (see BASELINE_FRAMES). Session state: survives
+        # episodes, so the baseline captured between cuts is there at a press.
+        self.episode_n = 0
+        self.baseline_probs = deque(maxlen=BASELINE_FRAMES)
+        self.T0 = None                 # baseline tumor mask, frozen at the press
+        self.fraction = None
+        self.fraction_state = FRAC_BASELINE
+        self.post = None               # pending final measurement after a release
         self.last_seg_end = None       # where this frame's sweep edge ended
         self.last_T = None             # this frame's tumor mask
         self.last_perim = None         # this frame's hull perimeter
@@ -326,6 +368,9 @@ class ToolheadNode(Node):
                          if self.get_parameter("publish_mask").value else None)
         self.pub_tip = (self.create_publisher(PointStamped, "/toolhead/tip", 10)
                         if self.get_parameter("publish_tip").value else None)
+        # One JSON object per processed frame (IDLE included) with the readouts
+        # the operator UI shows; see _publish_readouts for the fields.
+        self.pub_status = self.create_publisher(String, "/toolhead/status", 10)
 
         # The services stay available in both modes: they remain the way to
         # test without the robot, and a stop is still useful as an override.
@@ -339,6 +384,7 @@ class ToolheadNode(Node):
         self.dist = None               # distortion coefficients
         self.calib_wh = None           # (width, height) the calibration used
         self.calib_path = None         # which file was loaded
+        self.calib_stamp = None        # its modification time, for the header
         self._pose_warned = False
         self.n_pose = 0                # tip poses received this run
 
@@ -534,6 +580,9 @@ class ToolheadNode(Node):
         self.last_overlay = None
         self.episode_dir = None
         self.t_start = None
+        # A new episode must not show the previous one's last distance.
+        self.last_hull_dist = self.last_hull_dist_mm = None
+        self.last_warn_state = ""
 
     def _on_start(self, request, response):
         ok, msg = self._begin_episode(source="service")
@@ -563,10 +612,30 @@ class ToolheadNode(Node):
             self.state = SEEDING
             self.n_received = self.n_processed = self.n_dropped = 0
             self.t_start = time.time()
+        self.episode_n += 1
         self.show_distance_overlay = bool(
             self.get_parameter("show_distance_overlay").value)
         self.warn_distance_px = float(
             self.get_parameter("warn_distance_px").value)
+        self.warn_distance_mm = float(
+            self.get_parameter("warn_distance_mm").value)
+        # The camera is recalibrated between sessions and sometimes between
+        # cuts, so the newest calibration is read again at every press. A
+        # failure keeps the previous one rather than stopping a running session.
+        if self.tip_source != "detector":
+            try:
+                self._load_calibration()
+            except SystemExit as e:
+                self.get_logger().error(
+                    f"Calibration reload failed ({e}); keeping {self.calib_path}.")
+        # A release whose final measurement is still pending keeps its estimate.
+        self._finish_final(None, "next_press")
+        self.T0 = self._baseline_mask()
+        self.fraction = 0.0 if self.T0 is not None else None
+        # No baseline at the press (the tool never left the view): no estimate
+        # for this cut, though the final can still be measured after it.
+        self.fraction_state = (FRAC_ESTIMATE if self.T0 is not None
+                               else FRAC_NONE)
         if self.xlog is not None:
             trial = int(self.get_parameter("trial").value)
             self.xlog.episode_begin(self.episode_dir, {
@@ -703,12 +772,17 @@ class ToolheadNode(Node):
         if state_was == SEEDING or self.accum_mask is None:
             msg = "Stopped during seeding; no mask was produced."
             self.get_logger().warn(msg)
+            self.fraction, self.fraction_state = None, FRAC_BASELINE
             if self.xlog is not None:
                 self.xlog.episode_end(f"stopped_during_seeding ({source})")
             self._reset_episode_state()
             return True, msg
 
         paths = self._write_episode_outputs()
+        # The final fraction is measured on the IDLE frames that follow, once
+        # the tip has left the tumor (_step_idle).
+        self.post = {"A": self.accum_mask.copy(), "dir": self.episode_dir,
+                     "t0": time.time(), "probs": []}
         if self.xlog is not None:
             self.xlog.episode_end(source, outputs={
                 "accum": self.accum_mask, "T": self.last_T,
@@ -758,6 +832,13 @@ class ToolheadNode(Node):
                 "resect_side": self.resect_side,
                 "refined_seed_used": self.use_refine,
                 "final_mask_px": int(self.accum_mask.sum()),
+                "calibration": self.calib_path,
+                "calibration_mtime": (None if not self.calib_path else
+                                      datetime.fromtimestamp(os.path.getmtime(
+                                          self.calib_path)).isoformat(timespec="seconds")),
+                "baseline_px": None if self.T0 is None else int(self.T0.sum()),
+                "fraction_estimate": self.fraction,
+                "fraction_final": None,          # filled in by _finish_final
             }, f, indent=2)
         out.append("episode_info.json")
         return ", ".join(out)
@@ -774,7 +855,24 @@ class ToolheadNode(Node):
             if self.state == IDLE:
                 if rec is not None:
                     xl.frame_end(rec, IDLE)
-                return
+                if self.busy:
+                    return
+                self.busy = True
+                idle = True
+            else:
+                idle = False
+        if idle:
+            # Between cuts: keep the operator's view live and maintain the
+            # baseline and final fraction. Nothing here touches the mask.
+            try:
+                self._step_idle(self._proc_frame(self._to_bgr(msg)), msg.header)
+            except Exception as e:
+                self.get_logger().error(f"Idle frame failed: {e}",
+                                        throttle_duration_sec=5.0)
+            finally:
+                self.busy = False
+            return
+        with self.lock:
             if self.busy:
                 # Stay live rather than queueing: the newest frame matters more
                 # than completeness for an overlay the surgeon is watching.
@@ -858,6 +956,7 @@ class ToolheadNode(Node):
         if (nh, nw) != vis.shape[:2]:
             vis = cv2.resize(vis, (nw, nh), interpolation=cv2.INTER_LINEAR)
         self.pub_overlay.publish(self._to_msg(vis, header, "bgr8"))
+        self._publish_readouts(header)
 
     # ------------------------------------------------------- visual servoing
 
@@ -965,6 +1064,7 @@ class ToolheadNode(Node):
         self.calib_path = path
         stamp = datetime.fromtimestamp(os.path.getmtime(path)).strftime(
             "%Y-%m-%d %H:%M")
+        self.calib_stamp = stamp
         self.get_logger().info(
             f"Calibration [{self.camera_model}] {path} ({stamp})  "
             f"{width}x{height}  fx={self.K[0, 0]:.1f} fy={self.K[1, 1]:.1f} "
@@ -1378,6 +1478,9 @@ class ToolheadNode(Node):
             self.last_angle_deg, perp_dir, hull_pt, hull_dist = \
                 G.perp_direction_at_tip(perim, (tx, ty))
         self.last_hull_pt, self.last_hull_dist = hull_pt, hull_dist
+        mm_per_px = self._mm_per_px()
+        self.last_hull_dist_mm = (None if hull_dist is None or mm_per_px is None
+                                  else float(hull_dist) * mm_per_px)
         self.last_T, self.last_perim = T, perim
         self.last_seg_end = None
 
@@ -1650,6 +1753,8 @@ class ToolheadNode(Node):
                 self.accum_mask = np.isin(lab, list(keep))
 
     def _publish(self, frame_bgr, header, tip_xy):
+        if self.T0 is not None and self.accum_mask is not None:
+            self.fraction = float((self.accum_mask & self.T0).sum()) / float(self.T0.sum())
         disp = self.accum_mask
         if DILATE > 0:
             k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(DILATE | 1, 3),) * 2)
@@ -1695,6 +1800,137 @@ class ToolheadNode(Node):
             pt.point.y = float(tip_xy[1]) * scale
             pt.point.z = 0.0
             self.pub_tip.publish(pt)
+        self._publish_readouts(header)
+
+    # ----------------------------------------- between cuts and the readouts
+
+    def _proc_frame(self, native):
+        """Native camera frame -> processing frame, as _on_image does."""
+        self.native_hw = native.shape[:2]
+        if native.shape[0] != self.proc_size or native.shape[1] != self.proc_size:
+            return cv2.resize(native, (self.proc_size, self.proc_size),
+                              interpolation=cv2.INTER_AREA)
+        return native
+
+    def _tool_tip_now(self, frame):
+        """Where the tool tip is in this frame (processing px), or None when the
+        tool is out of view. Pose modes project the pose; detector mode runs the
+        keypoint detector."""
+        if self.tip_source != "detector":
+            return self._project_tip()
+        labels, scores, kps = self._detect(frame)
+        best = self.seed_mod.find_tip(labels, scores, kps) if len(scores) else None
+        return None if best is None else best[1]
+
+    def _step_idle(self, frame, header):
+        """One frame between cuts: publish the live view, keep the baseline
+        tumor mask current while the tool is out of view, and take the final
+        fraction of the last cut once the tip has left the tumor."""
+        self.H, self.W = frame.shape[:2]
+        prob = G.raw_tumor_mask(self.engine, cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                                self.H, self.W)
+        tip = self._tool_tip_now(frame)
+
+        if self.post is not None:
+            T = G.tumor_mask_from_prob(prob)
+            in_tumor = tip is not None and bool(
+                T[int(np.clip(round(tip[1]), 0, self.H - 1)),
+                  int(np.clip(round(tip[0]), 0, self.W - 1))])
+            if not in_tumor:
+                self.post["probs"].append(prob)
+            if len(self.post["probs"]) >= FINAL_FRAMES:
+                self._finish_final(G.tumor_mask_from_prob(
+                    np.mean(self.post["probs"], axis=0)), "measured")
+            elif time.time() - self.post["t0"] > FINAL_TIMEOUT:
+                self._finish_final(None, "timeout_tip_in_tumor")
+
+        if tip is None:
+            self.baseline_probs.append(prob)
+        # The last cut's result stays on screen until the next press.
+        if self.fraction_state not in (FRAC_ESTIMATE, FRAC_FINAL):
+            self.fraction = None
+            self.fraction_state = (
+                FRAC_READY if len(self.baseline_probs) >= BASELINE_FRAMES
+                else FRAC_BLOCKED if tip is not None else FRAC_BASELINE)
+
+        if self.pub_overlay is not None:
+            nh, nw = self.native_hw
+            vis = (cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+                   if (nh, nw) != frame.shape[:2] else frame)
+            self.pub_overlay.publish(self._to_msg(vis, header, "bgr8"))
+        self._publish_readouts(header)
+
+    def _baseline_mask(self):
+        """The baseline tumor mask from the last BASELINE_FRAMES tool-free
+        frames, or None if there are not enough of them yet."""
+        if len(self.baseline_probs) < BASELINE_FRAMES:
+            return None
+        T = G.tumor_mask_from_prob(np.mean(self.baseline_probs, axis=0))
+        return T if T.any() else None
+
+    def _finish_final(self, T_end, reason):
+        """Close the pending final measurement: the fraction is
+        |A| / (|A| + |T_end minus A|), written into the episode's
+        episode_info.json. T_end None keeps the estimate."""
+        post, self.post = self.post, None
+        if post is None:
+            return
+        final = None
+        if T_end is not None:
+            a = int(post["A"].sum())
+            rest = int((T_end & ~post["A"]).sum())
+            final = a / float(a + rest) if a + rest > 0 else None
+        if final is not None:
+            self.fraction, self.fraction_state = final, FRAC_FINAL
+        path = os.path.join(post["dir"], "episode_info.json")
+        try:
+            with open(path) as f:
+                info = json.load(f)
+            info.update({"fraction_final": final, "fraction_final_reason": reason,
+                         "final_tumor_px": None if T_end is None else int(T_end.sum())})
+            with open(path, "w") as f:
+                json.dump(info, f, indent=2)
+        except Exception as e:
+            self.get_logger().warn(f"Could not add the final fraction to {path}: {e}")
+        self.get_logger().info(
+            f"Final resected fraction: "
+            f"{'--' if final is None else f'{100 * final:.1f}%'} ({reason})")
+
+    def _mm_per_px(self):
+        """Millimetres per processing-frame pixel at the tip's depth, or None
+        without a pose. Exact only at that depth: the boundary point the
+        distance is measured to is assumed to lie at the same depth."""
+        if (self.tip_source == "detector" or self.last_pose is None
+                or self.K is None or self.W is None):
+            return None
+        z = self.last_pose[2]
+        if z <= 1e-6:
+            return None
+        fx_proc = self.K[0, 0] * self.W / float(self.calib_wh[0])
+        return z * 1000.0 / fx_proc
+
+    def _publish_readouts(self, header):
+        """/toolhead/status: what the operator UI shows, one JSON object per
+        processed frame. d_mm is null without a pose; fraction_state is one of
+        baseline, blocked, ready, estimate, final."""
+        status = {
+            "stamp": [int(header.stamp.sec), int(header.stamp.nanosec)],
+            "state": self.state,
+            "episode": self.episode_n,
+            "d_px": (None if self.last_hull_dist is None
+                     else round(float(self.last_hull_dist), 2)),
+            "d_mm": (None if self.last_hull_dist_mm is None
+                     else round(self.last_hull_dist_mm, 3)),
+            "warn_mm": self.warn_distance_mm,
+            "warn": self.last_warn_state == "warn",
+            "fraction": None if self.fraction is None else round(self.fraction, 4),
+            "fraction_state": self.fraction_state,
+            "calibration": self.calib_stamp,
+            "tip_source": self.tip_source,
+        }
+        msg = String()
+        msg.data = json.dumps(status)
+        self.pub_status.publish(msg)
 
     # ------------------------------------------------- distance readout
 
@@ -1705,6 +1941,12 @@ class ToolheadNode(Node):
         d = self.last_hull_dist
         if d is None or not np.isfinite(d):
             return "d = --", "invalid"
+        mm = self.last_hull_dist_mm
+        if mm is not None:
+            text = f"d = {mm:.1f} mm"
+            if self.warn_distance_mm > 0:
+                return text, ("warn" if mm < self.warn_distance_mm else "ok")
+            return text, "off"
         text = f"d = {int(round(d))} px"
         if self.warn_distance_px > 0:
             return text, ("warn" if d < self.warn_distance_px else "ok")
@@ -1811,7 +2053,9 @@ class ToolheadNode(Node):
             "overlay_on": self.show_distance_overlay,
             "d_shown": (self.last_d_text
                         if ok and self.show_distance_overlay else ""),
+            "hull_dist_mm": self.last_hull_dist_mm if ok else None,
             "warn_px": self.warn_distance_px,
+            "warn_mm": self.warn_distance_mm,
             "warn_state": self.last_warn_state if ok else "",
         })
 
