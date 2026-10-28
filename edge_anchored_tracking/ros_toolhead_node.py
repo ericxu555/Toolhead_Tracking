@@ -328,6 +328,7 @@ class ToolheadNode(Node):
         self.cut_path = []
         self.prev_tip_y = None
         self.keep_side = None      # which side of the cut is resected
+        self.prev_keep = None      # last frame's kept region, to carry the side
         self.prev_arc_frac = None  # last frame's arc, as a fraction of the perimeter
         self.prev_seg_len = None   # last frame's sweep length, in px
         self.seg_vetoed = 0        # consecutive frames the sweep leapt
@@ -722,6 +723,7 @@ class ToolheadNode(Node):
         self.cut_path = []
         self.prev_tip_y = None
         self.keep_side = None
+        self.prev_keep = None
         self.prev_arc_frac = None
         self.prev_seg_len = None
         self.seg_vetoed = 0
@@ -855,12 +857,16 @@ class ToolheadNode(Node):
                     tn = float(np.hypot(tv[0], tv[1]))
                     if tn > 1e-6:
                         nv = np.array([-tv[1], tv[0]]) / tn
-                        # Point it OUT of the tumor.
-                        probe = p0 + nv * 6.0
-                        if cv2.pointPolygonTest(
-                                np.asarray(perim, np.int32),
-                                (float(probe[0]), float(probe[1])),
-                                False) >= 0:
+                        # Point it OUT of the tumor: whichever way lies
+                        # further outside (signed distance). "Flip if the probe
+                        # is inside" never fires when the cut starts beyond the
+                        # probe length, and the stub can then split the tumor.
+                        pc = np.asarray(perim, np.int32)
+                        dp = cv2.pointPolygonTest(
+                            pc, (float(p0[0] + nv[0] * 6.0), float(p0[1] + nv[1] * 6.0)), True)
+                        dm = cv2.pointPolygonTest(
+                            pc, (float(p0[0] - nv[0] * 6.0), float(p0[1] - nv[1] * 6.0)), True)
+                        if dp > dm:
                             nv = -nv
                         self.start_stub = G._ray_to_boundary(
                             p0, nv, perim, float(H + W))
@@ -868,39 +874,47 @@ class ToolheadNode(Node):
                                              perim=perim,
                                              start_stub=self.start_stub)
                 if side_lab is not None:
-                    # Seeded once from a probe placed on the resection side of
-                    # the tip, then re-identified by that stored point every
-                    # frame: connectedComponents renumbers labels each frame, so
-                    # the seed is what says which label is which.
-                    # Identify the resected side by WHERE THE TWO REGIONS
-                    # LIE, recomputed every frame.
-                    #
-                    # Probing beside the tip is a coin flip: on the first frame
-                    # that can be partitioned the tip sits on the cut, where the
-                    # two regions meet. Storing that choice as a seed point then
-                    # drifts, because the cut advances and the regions reshape
-                    # around it -- the point ends up in the other region,
-                    # keep_side flips, and the side clip inverts, cutting the
-                    # sweep to a sliver for the rest of the episode. Comparing
-                    # the two regions' centroids answers it directly and does
-                    # not drift; connectedComponents renumbers every frame, so
-                    # recomputing is what keeps the identity stable.
+                    # Which region is the resection, as offline: chosen once by
+                    # the two regions' centroids (a probe beside the tip is a
+                    # coin flip, since the tip sits where the regions meet),
+                    # then CARRIED by overlap with the region kept last frame.
+                    # Re-choosing by centroid every frame can swap the regions
+                    # once an angled cut stacks them; labels are renumbered
+                    # every frame, but the region keeps its identity.
                     m1 = (side_lab == 1)
                     m2 = (side_lab == 2)
-                    if m1.any() and m2.any():
+                    # Until a separating frame has fixed the side as a region,
+                    # choose it afresh: a carried label number names nothing.
+                    if self.prev_keep is None:
+                        self.keep_side = None
+                    if self.prev_keep is not None and (m1.any() or m2.any()):
+                        o1 = int((self.prev_keep & m1).sum())
+                        o2 = int((self.prev_keep & m2).sum())
+                        # No overlap: the partition changed shape completely
+                        # (a new cut), so choose the side afresh.
+                        self.keep_side = (1 if o1 >= o2 else 2) if (o1 or o2) else None
+                    if self.keep_side is None and m1.any() and m2.any():
                         x1 = float(np.nonzero(m1)[1].mean())
                         x2 = float(np.nonzero(m2)[1].mean())
                         if self.resect_side == "left":
                             self.keep_side = 1 if x1 <= x2 else 2
                         else:
                             self.keep_side = 1 if x1 >= x2 else 2
-                # Once the cut no longer separates the tumor the labelling
-                # returns a single region, and a stored keep_side then names a
-                # label that no longer exists -- clipping against it would
-                # delete the whole sweep. With one region there is no side to
-                # choose, so the clip does not apply.
+                # Only clip when the partition genuinely separates the tumor:
+                # a region that degenerates to a sliver would otherwise let
+                # the whole polygon through in one frame. The minor region's
+                # share is bimodal (sound 41-42%, failed 0-0.2%); 5% sits in
+                # the gap. A stored keep_side that names a vanished label
+                # would delete the whole sweep, so it is dropped too.
+                separates = False
+                if side_lab is not None:
+                    n1 = int((side_lab == 1).sum())
+                    n2 = int((side_lab == 2).sum())
+                    separates = (n1 + n2 > 0 and min(n1, n2) / (n1 + n2) >= 0.05)
                 keep_now = self.keep_side
-                if (keep_now is not None and side_lab is not None
+                if side_lab is not None and not separates:
+                    keep_now = None
+                elif (keep_now is not None and side_lab is not None
                         and not (side_lab == keep_now).any()):
                     keep_now = None
                 seg_end = G.segment_end_on_perimeter(
@@ -1024,6 +1038,11 @@ class ToolheadNode(Node):
                     if side_lab is not None and keep_now:
                         frame_mask &= ~((side_lab > 0)
                                         & (side_lab != keep_now))
+                    # Carry the kept region to the next frame, only from a frame
+                    # whose partition separates the tumor (a degenerate frame's
+                    # region spans the whole tumor and would flip the side).
+                    if side_lab is not None and keep_now and separates:
+                        self.prev_keep = (side_lab == keep_now)
 
         # Monotonic union, re-clipped to the tumor every frame. The clip is
         # load-bearing: it lets a wrongly-included pixel drop back out once

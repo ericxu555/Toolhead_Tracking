@@ -81,7 +81,6 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 import numpy as np, cv2, torch
 from PIL import Image
-from scipy.ndimage import binary_fill_holes
 from src.inference_engine import InferenceEngine
 
 video_dir = sys.argv[1]
@@ -139,19 +138,15 @@ MASK_THRESHOLD = 0.5
 def tumor_mask_from_prob(prob):
     """The tumor mask the pipeline acts on, from a (smoothed) probability map.
 
-    Holes are filled: the boundary-weighted loss leaves interior specks
-    unlabelled where the tissue is specular or blood-darkened, and those are
-    not holes in the tumor.
+    Holes are NOT filled: the mask is the segmenter's output as thresholded.
+    Interior holes do not move the convex hull the geometry is built on.
 
     Every connected region is KEPT. Keeping only the largest silently deleted
     a genuinely multi-focal tumor, and on hazy frames -- where the model
     fragments one tumor into patches -- it deleted most of the real mask with
     it.
     """
-    m = prob > MASK_THRESHOLD
-    if m.any():
-        m = binary_fill_holes(m)
-    return m
+    return prob > MASK_THRESHOLD
 
 
 def contour_of(T):
@@ -813,6 +808,7 @@ def main():
     _SEG_VETOED = [0]         # consecutive frames the sweep leapt
     _START_STUB = [None]  # start-end anchor, fixed on first use
     _KEEP_SIDE = [None]   # which partition label is the resection
+    _PREV_KEEP = [None]   # last frame's kept region, to recognise the side by overlap
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(DILATE | 1, 3),) * 2) if DILATE > 0 else None
 
     for i, fp in enumerate(files):
@@ -979,12 +975,20 @@ def main():
                     _tn = float(np.hypot(_tv[0], _tv[1]))
                     if _tn > 1e-6:
                         _nv = np.array([-_tv[1], _tv[0]]) / _tn
-                        # Point it OUT of the tumor.
-                        _probe = _p0 + _nv * 6.0
-                        if cv2.pointPolygonTest(
-                                np.asarray(perim, np.int32),
-                                (float(_probe[0]), float(_probe[1])),
-                                False) >= 0:
+                        # Point it OUT of the tumor: whichever way lies
+                        # further outside (signed distance), not "flip if the
+                        # probe is inside". When the cut starts more than the
+                        # probe length outside the boundary both probes are
+                        # outside, nothing flips, and half the time the stub
+                        # runs INTO the tumor and splits it top/bottom. On
+                        # tissue_60 that hung on a 1-2 px shift of the first
+                        # tip point (5 px tip noise: Dice 0.93 -> 0.04).
+                        _pc = np.asarray(perim, np.int32)
+                        _dp = cv2.pointPolygonTest(
+                            _pc, (float(_p0[0] + _nv[0] * 6.0), float(_p0[1] + _nv[1] * 6.0)), True)
+                        _dm = cv2.pointPolygonTest(
+                            _pc, (float(_p0[0] - _nv[0] * 6.0), float(_p0[1] - _nv[1] * 6.0)), True)
+                        if _dp > _dm:
                             _nv = -_nv
                         _START_STUB[0] = _ray_to_boundary(
                             _p0, _nv, perim, float(H + W))
@@ -1009,14 +1013,41 @@ def main():
                     # keep_side flipped and the side clip cut the sweep from
                     # 27,110 px to 622 px for the rest of the episode.
                     #
-                    # Comparing the two regions' centroids answers it directly,
-                    # and has no drift -- on failure_case1 region 1 stayed the
-                    # right-hand one at every frame (c1_x 301->346 against
-                    # c2_x 210->220). connectedComponents renumbers each frame,
-                    # so recomputing is also what keeps the identity stable.
+                    # Comparing the two regions' centroids answers it directly
+                    # on the frame the side is first chosen -- on failure_case1
+                    # region 1 stayed the right-hand one at every frame (c1_x
+                    # 301->346 against c2_x 210->220).
+                    #
+                    # After that the side is CARRIED by overlap with the region
+                    # kept last frame, not re-chosen by centroid: once a cut
+                    # runs at an angle the two regions stack instead of lying
+                    # side by side, and the centroid comparison can swap them.
+                    # connectedComponents renumbers every frame, so the labels
+                    # mean nothing between frames but the region does. Measured
+                    # on the 10 labeled resections: re-choosing by centroid
+                    # every frame halved the final mask of full_exp6 under the
+                    # every-frame re-anchored tip (3,164 px against a 6,764 px
+                    # label, Dice 0.42); carrying by overlap kept 7,967 px
+                    # (Dice 0.87). Mean Dice over the 10 resections was
+                    # unchanged for the other tip schedules.
                     _m1 = (_lab == 1)
                     _m2 = (_lab == 2)
-                    if _m1.any() and _m2.any():
+                    # Until a separating frame has fixed the side as a REGION,
+                    # choose it afresh: a label number carried from a frame that
+                    # did not separate names nothing on the next one. On
+                    # tissue_60 a label seeded on a 47 px sliver frame was
+                    # reused at the first real split (f109) and kept the
+                    # sliver for the whole episode (Dice 0.93 -> 0.04) under
+                    # 5 px of tip noise.
+                    if _PREV_KEEP[0] is None:
+                        _KEEP_SIDE[0] = None
+                    if _PREV_KEEP[0] is not None and (_m1.any() or _m2.any()):
+                        _o1 = int((_PREV_KEEP[0] & _m1).sum())
+                        _o2 = int((_PREV_KEEP[0] & _m2).sum())
+                        # No overlap at all means the partition changed shape
+                        # completely (a new cut); choose the side afresh.
+                        _KEEP_SIDE[0] = (1 if _o1 >= _o2 else 2) if (_o1 or _o2) else None
+                    if _KEEP_SIDE[0] is None and _m1.any() and _m2.any():
                         _x1 = float(np.nonzero(_m1)[1].mean())
                         _x2 = float(np.nonzero(_m2)[1].mean())
                         if RESECT_SIDE == "left":
@@ -1024,16 +1055,24 @@ def main():
                         else:
                             _KEEP_SIDE[0] = 1 if _x1 >= _x2 else 2
 
-                    # Only clip when the partition genuinely has two sides.
-                    # Once the cut no longer separates the tumor, the labelling
-                    # returns a single region and the stored keep_side names a
-                    # label that no longer exists -- clipping against it would
-                    # delete the whole sweep (measured: 11,448 px -> 1,164 px
-                    # on the 0916 screencast, where region 2 is empty from
-                    # f100 onward). With one region there is no side to choose,
-                    # so the clip simply does not apply.
+                    # Only clip when the partition genuinely SEPARATES the
+                    # tumor. Once the cut no longer separates it, the labelling
+                    # collapses towards one region and the side has no meaning.
+                    # Testing only whether the kept label still exists misses
+                    # the dangerous half: a region that degenerates to a sliver
+                    # (84 px against 40,005 px at f625 of the 0:12 case) let
+                    # the whole 23,409 px polygon through in one frame. The
+                    # minor region's share is sharply bimodal (sound partitions
+                    # 40.9-42.1%, failed ones 0.0-0.2%), so any cut-off between
+                    # about 1% and 40% behaves the same; 5% sits in that gap.
+                    _n1 = int(_m1.sum())
+                    _n2 = int(_m2.sum())
+                    _tot = _n1 + _n2
+                    _separates = (_tot > 0 and min(_n1, _n2) / _tot >= 0.05)
                     _keep = _KEEP_SIDE[0]
-                    if _keep is not None and not (_lab == _keep).any():
+                    if not _separates:
+                        _keep = None
+                    elif _keep is not None and not (_lab == _keep).any():
                         _keep = None
                 # THE SWEEP IS CONTINUOUS: A ONE-FRAME LEAP IS NOT A SWEEP.
                 #
@@ -1269,6 +1308,12 @@ def main():
                     # so applying it to the region itself closes that path.
                     if _lab is not None and _keep:
                         frame_mask &= ~((_lab > 0) & (_lab != _keep))
+                    # Carry the kept region to the next frame -- only from a
+                    # frame whose partition separates the tumor: a degenerate
+                    # frame's region spans the whole tumor and would match the
+                    # larger side next frame (the permanent flip at f626).
+                    if _lab is not None and _keep and _separates:
+                        _PREV_KEEP[0] = (_lab == _keep)
 
         # REVERTED 2026-08-03: tried dropping the trailing `& T` here (see
         # git history / prior session) on the theory that it was retroactively
