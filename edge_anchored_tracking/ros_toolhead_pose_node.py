@@ -262,6 +262,10 @@ class ToolheadNode(Node):
         # depth from the pose, focal length from the calibration), and this
         # threshold replaces warn_distance_px. 0 disables the warning.
         self.declare_parameter("warn_distance_mm", 2.0)
+        # Frames in the trailing moving average on the tip. The vision tip
+        # needs it; the visual-servoing pose is already filtered by the smoother,
+        # where a 15-frame window at ~6 Hz only adds ~1.2 s of lag (1 = none).
+        self.declare_parameter("tip_smooth", TIP_SMOOTH)
         # Experiment logging (experiment_log.py). Off by default: a normal run
         # writes exactly what it always has.
         self.declare_parameter("experiment", False)
@@ -276,6 +280,7 @@ class ToolheadNode(Node):
         self.declare_parameter("trial", -1)
 
         self.image_topic = self.get_parameter("image_topic").value
+        self.tip_smooth = max(1, int(self.get_parameter("tip_smooth").value))
         self.output_root = self.get_parameter("output_root").value
         self.resect_side = self.get_parameter("resect_side").value
         self.use_refine = bool(self.get_parameter("refine").value)
@@ -653,7 +658,10 @@ class ToolheadNode(Node):
                 "trigger_mode": self.trigger_mode,
                 "trigger_source": source,
                 "tip_source": self.tip_source,
+                "tip_smooth": self.tip_smooth,
                 "episode_dir": self.episode_dir,
+                # Re-read at this press; a copy goes into the episode folder.
+                "calib_path": self.calib_path,
             })
         self.get_logger().info(f"Episode started -> {self.episode_dir}")
         # Seeding is driven entirely by the image callback, so if the camera is
@@ -1379,7 +1387,7 @@ class ToolheadNode(Node):
                 f"image-pose dt={dt * 1e3:+.0f}ms",
                 throttle_duration_sec=1.0)
             self.tip_history.append((float(tip[0]), float(tip[1])))
-            w = self.tip_history[-TIP_SMOOTH:]
+            w = self.tip_history[-self.tip_smooth:]
             tx = float(np.mean([q[0] for q in w]))
             ty = float(np.mean([q[1] for q in w]))
             self.mask_tips.append((tx, ty))
@@ -1415,7 +1423,7 @@ class ToolheadNode(Node):
         # at the cost of the tip lagging slightly during fast motion. Measured
         # against the offline result on three recorded episodes, the final
         # masks agree at IoU 0.976-0.997.
-        w = self.tip_history[-TIP_SMOOTH:]
+        w = self.tip_history[-self.tip_smooth:]
         tx = float(np.mean([p[0] for p in w]))
         ty = float(np.mean([p[1] for p in w]))
 
@@ -2109,7 +2117,7 @@ class ToolheadNode(Node):
             "argv": list(sys.argv),
             "params": params,
             "constants": {
-                "TIP_SMOOTH": TIP_SMOOTH, "MASK_EMA": MASK_EMA,
+                "TIP_SMOOTH": self.tip_smooth, "MASK_EMA": MASK_EMA,
                 "DILATE": DILATE, "PROC_SIZE": PROC_SIZE,
                 "SEED_MAX_FRAMES": SEED_MAX_FRAMES,
                 "SEED_MIN_VOTES": SEED_MIN_VOTES,

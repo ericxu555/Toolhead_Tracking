@@ -625,7 +625,8 @@ Output/session_<stamp>/
                        sweep endpoint, displayed text, warning state
     raw/NNNNNN.png     every received frame at 540x540 (NNNNNN = frame_idx)
     overlay.mp4        what was displayed; overlay_frames.csv maps frames
-    snapshots/         mask + tumor mask every 15 frames, final cutline
+    calibration.yaml   the calibration this episode's mm values used
+    snapshots/         mask + tumor mask every snapshot_every frames, final cutline
     log_summary.json   frames saved, drops, GB/min
 ```
 
@@ -634,7 +635,8 @@ Output/session_<stamp>/
 | `show_distance_overlay` | `true` | Draw the distance readout |
 | `warn_distance_px` | `0` | Readout turns red below this distance; 0 = never |
 | `experiment` | `false` | Write the session logs above |
-| `snapshot_every` | `15` | Mask snapshot interval, in tracked frames |
+| `snapshot_every` | `15` | Mask snapshot interval, in tracked frames (1 = every frame) |
+| `tip_smooth` | `15` | Frames in the trailing moving average on the tip (1 = none; the visual-servoing pose is already smoothed) |
 | `raw_png_compression` | `1` | PNG level for raw frames (0-9; 1 is fast, lossless) |
 | `tumor_id`, `condition`, `operator`, `trial` | empty, `-1` | Episode metadata; `trial` < 0 numbers episodes in order |
 

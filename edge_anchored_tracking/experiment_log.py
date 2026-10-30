@@ -510,6 +510,15 @@ class ExperimentLog:
         self._open_csv("ep_events", os.path.join(d, "events.csv"), EVENTS_COLS)
         self._open_csv("overlay", os.path.join(d, "overlay_frames.csv"),
                        OVERLAY_COLS)
+        # The calibration is re-read at every press and can change between
+        # cuts, so each episode keeps the exact file its mm values came from.
+        calib = meta.get("calib_path")
+        if calib and os.path.isfile(calib):
+            try:
+                shutil.copy2(calib, os.path.join(d, "calibration" + os.path.splitext(calib)[1]))
+                meta["calib_sha256"] = sha256_of(calib)
+            except OSError as e:
+                meta["calib_copy_error"] = str(e)
         with open(os.path.join(d, "meta.json"), "w") as f:
             json.dump(dict(meta, units_note=LABEL_NOTE), f, indent=2,
                       default=str)
@@ -620,7 +629,7 @@ class ExperimentLog:
 
         self._snap_count += 1
         if (self.snapshot_every > 0 and info.get("accum") is not None
-                and self._snap_count % self.snapshot_every == 1):
+                and (self._snap_count - 1) % self.snapshot_every == 0):  # 1st, (N+1)th, ...; N=1: every frame
             self._put(self._write_snapshot, self.episode_dir, rec["idx"],
                       info["accum"].copy(), info.get("T"), kind="snapshot")
 
